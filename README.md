@@ -13,7 +13,7 @@ cat = qmlh5.read_catalog('huge_ml_catalog.h5')
 cat.write('out.qml',format='QUAKEML')
 
 # OR you can write out again as an hdf5 object
-cat.write_catalog('out.h5') # note that "write_catalog" is used here instead of ObsPy's 'write'
+qmlh5.write_catalog(cat,'out.h5')
 ```
 
 One day may attempt to add this into ObsPy directly...
