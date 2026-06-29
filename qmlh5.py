@@ -1,7 +1,4 @@
 """
-
-VERSION 1.1 (29 June 2026) https://github.com/filefolder/qmlh5
-
 qmlh5.py — Binary HDF5 storage for QuakeML 1.2 earthquake catalogs.
 
 All objects stored as flat columnar arrays. Cross-object links use integer
@@ -272,7 +269,7 @@ class _ComPool:
         grp.create_dataset("ci_idx",data=np.array(self.ci,dtype=np.int32),**c)
 
 # ---------------------------------------------------------------------------
-# wmlh5 class — write path
+# qmlh5 class — write path
 # ---------------------------------------------------------------------------
 
 class qmlh5:
@@ -1265,7 +1262,8 @@ class qmlh5:
         ev=self._ra(g,"event_idx")
         return np.array([],dtype=np.int64) if ev is None else np.where(ev==ei)[0]
 
-    def read_catalog(self,event_indices=None,progress=True):
+    def read_catalog(self,event_indices=None,progress=True,
+                     starttime=None,endtime=None):
         """Reconstruct an ObsPy Catalog.
 
         Parameters
@@ -1278,6 +1276,13 @@ class qmlh5:
             ``True``. Has no effect if tqdm is not installed, or for catalogs
             of 100 events or fewer (where the read finishes in well under a
             second and the bar would just flash by).
+        starttime, endtime : str or :class:`~obspy.UTCDateTime`, optional
+            Time-range filter applied BEFORE constructing ObsPy objects. Each
+            event's first origin's `time` is used as its representative time.
+            Events with no origins are excluded when either bound is given.
+            A real speedup vs filtering the loaded catalog after the fact
+            because per-event ObsPy object construction (the dominant read
+            cost) is skipped for filtered-out events.
         """
         if not OBSPY_AVAILABLE: raise ImportError("ObsPy required")
         f=self._f
@@ -1300,22 +1305,26 @@ class qmlh5:
             # Prefetch every child group's columns ONCE, and precompute the
             # per-event row slice arrays. This collapses O(events × columns)
             # full-column reads into O(columns) reads + O(events) lookups.
-            og_cols   = self._prefetch_group("origins")
-            mg_cols   = self._prefetch_group("magnitudes")
-            sm_cols   = self._prefetch_group("station_magnitudes")
-            pk_cols   = self._prefetch_group("picks")
-            am_cols   = self._prefetch_group("amplitudes")
-            fm_cols   = self._prefetch_group("focal_mechanisms")
-            ar_cols   = self._prefetch_group("arrivals")
-            ct_cols   = self._prefetch_group("composite_times")
-            oq_cols   = self._prefetch_group("origin_quality")
-            ou_cols   = self._prefetch_group("origin_uncertainty")
-            ce_cols   = self._prefetch_group("confidence_ellipsoids")
-            mt_cols   = self._prefetch_group("moment_tensors")
-            du_cols   = self._prefetch_group("data_used")
-            sc_cols   = self._prefetch_group("station_mag_contributions")
-            tw_cols   = self._prefetch_group("time_windows")
-            ed_cols   = self._prefetch_group("event_descriptions")
+            # Prefetch can take a few seconds for very large catalogs (string
+            # decoding dominates) but it's only ~3% of total load time, so we
+            # don't show a separate bar for it — the per-event bar that follows
+            # gives the user a meaningful ETA for the actual bulk of the work.
+            _prefetch_targets = [
+                "origins","magnitudes","station_magnitudes","picks","amplitudes",
+                "focal_mechanisms","arrivals","composite_times","origin_quality",
+                "origin_uncertainty","confidence_ellipsoids","moment_tensors",
+                "data_used","station_mag_contributions","time_windows",
+                "event_descriptions",
+            ]
+            _pf = {name: self._prefetch_group(name) for name in _prefetch_targets}
+            og_cols=_pf["origins"];           mg_cols=_pf["magnitudes"]
+            sm_cols=_pf["station_magnitudes"];pk_cols=_pf["picks"]
+            am_cols=_pf["amplitudes"];        fm_cols=_pf["focal_mechanisms"]
+            ar_cols=_pf["arrivals"];          ct_cols=_pf["composite_times"]
+            oq_cols=_pf["origin_quality"];    ou_cols=_pf["origin_uncertainty"]
+            ce_cols=_pf["confidence_ellipsoids"]; mt_cols=_pf["moment_tensors"]
+            du_cols=_pf["data_used"];         sc_cols=_pf["station_mag_contributions"]
+            tw_cols=_pf["time_windows"];      ed_cols=_pf["event_descriptions"]
             og_s, og_e = self._build_event_slices(og_cols, n)
             mg_s, mg_e = self._build_event_slices(mg_cols, n)
             sm_s, sm_e = self._build_event_slices(sm_cols, n)
@@ -1323,8 +1332,36 @@ class qmlh5:
             am_s, am_e = self._build_event_slices(am_cols, n)
             fm_s, fm_e = self._build_event_slices(fm_cols, n)
 
-            # Wrap with tqdm only when explicitly enabled, tqdm is importable,
-            # and the catalog is large enough that the bar isn't just noise.
+            # Optional time-range filtering. We use each event's first origin's
+            # `time_value` as its representative time (cheap — the column is
+            # already prefetched, and `og_s[ei]` is the row index of that
+            # origin). Events with no origins, or with NaN origin times, are
+            # excluded from time-filtered results because there's no defensible
+            # time to compare against. The filter is applied to `event_indices`
+            # before the per-event loop, so the per-event ObsPy object
+            # construction cost (the dominant cost of read_catalog) drops
+            # proportionally to how aggressive the filter is.
+            if starttime is not None or endtime is not None:
+                event_times = np.full(n, np.nan)
+                if og_cols is not None and og_s is not None:
+                    has_orig = og_s < og_e
+                    if has_orig.any():
+                        event_times[has_orig] = og_cols["time_value"][og_s[has_orig]]
+                mask = ~np.isnan(event_times)
+                if starttime is not None:
+                    st = _ts(UTCDateTime(starttime))
+                    mask &= event_times >= st
+                if endtime is not None:
+                    et = _ts(UTCDateTime(endtime))
+                    mask &= event_times <= et
+                if isinstance(event_indices, range) and event_indices == range(n):
+                    event_indices = np.flatnonzero(mask).tolist()
+                else:
+                    event_indices = [ei for ei in event_indices if mask[ei]]
+
+            # Wrap the per-event loop with tqdm only when explicitly enabled,
+            # tqdm is importable, and the (possibly filtered) catalog is large
+            # enough that the bar isn't just noise.
             if progress and TQDM_AVAILABLE and len(event_indices) > 100:
                 ei_iter = tqdm(event_indices, desc="Reading events",
                                unit="event", leave=False)
@@ -2048,7 +2085,8 @@ class qmlh5:
 #   cat.write_catalog("out.h5")        # method patched onto Catalog below
 #
 # ---------------------------------------------------------------------------
-def read_catalog(path, event_indices=None, progress=True):
+def read_catalog(path, event_indices=None, progress=True,
+                 starttime=None, endtime=None):
     """Read a QuakeML/HDF5 file and return an ObsPy :class:`Catalog`.
 
     Parameters
@@ -2063,13 +2101,20 @@ def read_catalog(path, event_indices=None, progress=True):
         Show a tqdm progress bar while reconstructing events. Defaults to
         ``True``. Has no effect if tqdm is not installed, or for catalogs of
         100 events or fewer.
+    starttime, endtime : str or :class:`~obspy.UTCDateTime`, optional
+        Time-range filter applied BEFORE constructing ObsPy objects. Each
+        event's first origin's `time` is used as its representative time.
+        Events with no origins are excluded when either bound is given.
+        Faster than ``cat.filter(...)`` after loading because filtered-out
+        events skip per-event ObsPy object construction entirely.
 
     Returns
     -------
     obspy.core.event.Catalog
     """
     with qmlh5(path, "r") as q:
-        return q.read_catalog(event_indices=event_indices, progress=progress)
+        return q.read_catalog(event_indices=event_indices, progress=progress,
+                              starttime=starttime, endtime=endtime)
 
 
 def write_catalog(catalog, path, progress=True, chunk_size=10000):

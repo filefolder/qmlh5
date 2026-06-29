@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "qmlh5"
+version = "1.1.0"
+description = "QuakeML to HDF5 read/write utility for ObsPy earthquake catalog objects"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = ['obspy','h5py','numpy']
