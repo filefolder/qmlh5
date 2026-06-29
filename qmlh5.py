@@ -1,8 +1,8 @@
 """
-VERSION 1.0
 
+VERSION 1.1 (29 June 2026) https://github.com/filefolder/qmlh5
 
-qmlh5.py — Binary HDF5 storage for QuakeML (1.2 hardwired) earthquake catalogs.
+qmlh5.py — Binary HDF5 storage for QuakeML 1.2 earthquake catalogs.
 
 All objects stored as flat columnar arrays. Cross-object links use integer
 indices. Enums stored as uint8 with JSON enum_map attribute. Timestamps as
@@ -10,11 +10,11 @@ float64 Unix seconds (NaN = missing). Signed int sentinel: -1 = absent.
 
 Public API
 ----------
-    cat = qmlh5.read_catalog("incat.h5")        # module-level read
-    qmlh5.write_catalog(cat, "outcat.h5")       # module-level write
-    cat.write_catalog("outcat.h5")              # method on ObsPy Catalog
+    cat = qmlh5.read_catalog("cat.h5")        # module-level read
+    qmlh5.write_catalog(cat, "out.h5")        # module-level write
+    cat.write_catalog("out.h5")               # method on ObsPy Catalog
 
-The lower-level :class:`QMLH5` class supports column-oriented queries
+The lower-level :class:`qmlh5` class supports column-oriented queries
 (:meth:`query_bbox`, :meth:`query_magnitude`, :meth:`query_radius`,
 :meth:`query_polygon`, :meth:`query_depth`, :meth:`query_arrivals`) and
 returns columnar dictionaries via :meth:`origins_dataframe`,
@@ -61,6 +61,16 @@ try:
     OBSPY_AVAILABLE = True
 except ImportError:
     OBSPY_AVAILABLE = False
+
+# tqdm is an optional dependency. When present, write operations show a
+# progress bar per event. `tqdm.auto` picks the right frontend for terminal
+# vs notebook automatically. If tqdm isn't installed, the progress=True
+# default silently falls back to no bar.
+try:
+    from tqdm.auto import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Enum maps  (uint8 code → QuakeML string)
@@ -232,31 +242,46 @@ class _CITable:
         grp.create_dataset("creation_time",data=np.array(self.ct,dtype=np.float64),**c)
 
 class _ComPool:
-    def __init__(self): self.text,self.id,self.ci=[],[],[]
+    """Append-only flat pool of comments. Returns (global_offset, count) per
+    caller so each parent object can later locate its slice. Comments-per-event
+    grows with the catalog, so this pool is incrementally flushed during
+    chunked writes via :meth:`flush_to`."""
+    def __init__(self):
+        self.text,self.id,self.ci=[],[],[]
+        self._baseline=0   # total rows already flushed to disk
     def add(self,comments,ci_tbl):
-        off=len(self.text)
+        off=self._baseline+len(self.text)
         for c in (comments or []):
             self.text.append(c.text or "")
             self.id.append(_rid(getattr(c,"resource_id",None)))
             self.ci.append(int(ci_tbl.add(c.creation_info)))
-        return off, len(self.text)-off
+        return off, self._baseline+len(self.text)-off
+    def flush_to(self,grp,qmlh5):
+        """Append the in-memory buffer to extensible HDF5 datasets and clear it."""
+        if not self.text: return
+        qmlh5._ds_append(grp,"text",np.array(self.text,dtype=object))
+        qmlh5._ds_append(grp,"id",  np.array(self.id,  dtype=object))
+        qmlh5._ds_append(grp,"ci_idx",np.array(self.ci,dtype=np.int32))
+        self._baseline+=len(self.text)
+        self.text.clear(); self.id.clear(); self.ci.clear()
     def write(self,grp,c,cs):
+        """Final non-chunked write path (used when chunking is disabled)."""
         if not self.text: return
         grp.create_dataset("text",data=np.array(self.text,dtype=object),dtype=_VLEN,**cs)
         grp.create_dataset("id",  data=np.array(self.id,  dtype=object),dtype=_VLEN,**cs)
         grp.create_dataset("ci_idx",data=np.array(self.ci,dtype=np.int32),**c)
 
 # ---------------------------------------------------------------------------
-# QMLH5 class — write path
+# wmlh5 class — write path
 # ---------------------------------------------------------------------------
 
-class QMLH5:
+class qmlh5:
     """
     Read/write QuakeML 1.2 catalogs as columnar HDF5.
 
-    with QMLH5("cat.h5","w") as q: q.write_catalog(cat)
-    with QMLH5("cat.h5")     as q: cat = q.read_catalog()
-    with QMLH5("cat.h5")     as q: d = q.origins_dataframe()
+    with qmlh5("cat.h5","w") as q: q.write_catalog(cat)
+    with qmlh5("cat.h5")     as q: cat = q.read_catalog()
+    with qmlh5("cat.h5")     as q: d = q.origins_dataframe()
     """
     FORMAT="qmlh5"; FORMAT_VERSION="1.0"; QUAKEML_VERSION="1.2"; CHUNK=1024
     _C  = dict(compression="gzip",compression_opts=4,shuffle=True)
@@ -282,10 +307,43 @@ class QMLH5:
             ds=grp.create_dataset(name,data=data,chunks=chunk,**self._C)
         if enum_map: ds.attrs["enum_map"]=json.dumps(enum_map)
         return ds
+
+    def _ds_append(self,grp,name,data,enum_map=None):
+        """Append to a resizable dataset, creating it on the first call.
+        Used during chunked catalog writes so accumulator memory can be
+        released after every chunk instead of held until the end."""
+        n=len(data)
+        if n==0: return None
+        if name not in grp:
+            chunk=(min(self.CHUNK,n),)
+            if data.dtype.kind=="O":
+                ds=grp.create_dataset(name,data=data,dtype=_VLEN,
+                                      chunks=chunk,maxshape=(None,),**self._CS)
+            else:
+                ds=grp.create_dataset(name,data=data,
+                                      chunks=chunk,maxshape=(None,),**self._C)
+            if enum_map: ds.attrs["enum_map"]=json.dumps(enum_map)
+            return ds
+        ds=grp[name]
+        old=ds.shape[0]; ds.resize((old+n,)); ds[old:old+n]=data
+        return ds
+
     def _sa(self,lst): return np.array(lst,dtype=object)  # string array
 
     # ------------------------------------------------------------------
-    def write_catalog(self,catalog):
+    def write_catalog(self,catalog,progress=True,chunk_size=10000):
+        """Write an ObsPy Catalog to this HDF5 file.
+
+        The catalog is processed in chunks of ``chunk_size`` events. After
+        each chunk the per-row accumulators (origins, magnitudes, picks,
+        arrivals, comments, etc.) are appended to extensible HDF5 datasets
+        and cleared, so peak RAM stays proportional to ``chunk_size`` rather
+        than to the entire catalog. For a 600k-event catalog the default
+        chunk_size of 10k brings peak RAM from tens of GB down to ~hundreds
+        of MB. Set ``chunk_size=None`` to disable chunking (the original
+        single-flush behaviour) for tiny catalogs where the overhead of
+        extensible datasets isn't worth it.
+        """
         if self._f is None: raise RuntimeError("File not open")
         f=self._f
         f.attrs.update({"format":self.FORMAT,"format_version":self.FORMAT_VERSION,
@@ -304,6 +362,24 @@ class QMLH5:
         cat_coff,cat_ccnt=cp.add(getattr(catalog,"comments",None),ci)
         f.attrs["catalog_comment_offset"]=int(cat_coff)
         f.attrs["catalog_comment_count"]=int(cat_ccnt)
+
+        # ---- chunked-write baseline counters ----
+        # When chunking is on, accumulator buffers get periodically flushed and
+        # cleared. Any offset/index field captured against `len(buf)` during
+        # accumulation must therefore be made global by adding the count of rows
+        # already flushed (these counters). They're attributes on self so the
+        # _flush_chunk closure (defined below) can mutate them.
+        self._n_ed_written = 0   # event_descriptions
+        self._n_ar_written = 0   # arrivals
+        self._n_ct_written = 0   # composite_times
+        self._n_oq_written = 0   # origin_quality rows
+        self._n_ou_written = 0   # origin_uncertainty rows
+        self._n_ce_written = 0   # confidence_ellipsoids rows
+        self._n_sc_written = 0   # station_mag_contributions
+        self._n_tw_written = 0   # time_windows
+        self._n_mt_written = 0   # moment_tensors
+        self._n_du_written = 0   # data_used
+        self._n_fmwp_written = 0  # focal mech waveform pool entries
 
         # ---- accumulator dicts ----
         ev =dict(pid=[],po=[],pm=[],pf=[],etype=[],ecert=[],ci=[],
@@ -372,10 +448,324 @@ class QMLH5:
                 mid=[],cat=[],inv=[],ci=[],duoff=[],ducnt=[],coff=[],ccnt=[])
         du=dict(wt=[],sc=[],cc=[],sp=[],lp=[])
 
+        # ---- _flush_chunk: append per-row accumulators to extensible datasets
+        # ---- and clear them. Called periodically during the event loop and
+        # ---- once at the end. The waveform_id and creation_info dedup tables
+        # ---- stay in RAM (they grow with uniqueness, not row count) and are
+        # ---- written once at the very end.
+        def _g(n): return f.require_group(n)
+        def _f64(lst): return np.array(lst,dtype=np.float64)
+        def _u32(lst): return np.array(lst,dtype=np.uint32)
+        def _i32(lst): return np.array(lst,dtype=np.int32)
+        def _u8(lst):  return np.array(lst,dtype=np.uint8)
+        def _i8(lst):  return np.array(lst,dtype=np.int8)
+
+        def _flush_chunk():
+            if ev["pid"]:
+                g=_g("catalog")
+                self._ds_append(g,"public_id",self._sa(ev["pid"]))
+                self._ds_append(g,"preferred_origin_id",self._sa(ev["po"]))
+                self._ds_append(g,"preferred_magnitude_id",self._sa(ev["pm"]))
+                self._ds_append(g,"preferred_focmec_id",self._sa(ev["pf"]))
+                self._ds_append(g,"event_type",_u8(ev["etype"]),enum_map=EVENT_TYPE)
+                self._ds_append(g,"event_type_certainty",_u8(ev["ecert"]),enum_map=EVENT_TYPE_CERTAINTY)
+                self._ds_append(g,"ci_idx",_i32(ev["ci"]))
+                self._ds_append(g,"desc_offset",_u32(ev["doff"])); self._ds_append(g,"desc_count",_u32(ev["dcnt"]))
+                self._ds_append(g,"comment_offset",_u32(ev["coff"])); self._ds_append(g,"comment_count",_u32(ev["ccnt"]))
+                for k in ev: ev[k].clear()
+
+            if ed["text"]:
+                g=_g("event_descriptions")
+                n=len(ed["text"])
+                self._ds_append(g,"text",self._sa(ed["text"]))
+                self._ds_append(g,"type",_u8(ed["type"]),enum_map=EVENT_DESC_TYPE)
+                self._n_ed_written+=n
+                for k in ed: ed[k].clear()
+
+            if or_["pid"]:
+                g=_g("origins")
+                self._ds_append(g,"public_id",self._sa(or_["pid"]))
+                self._ds_append(g,"event_idx",_u32(or_["eidx"]))
+                self._ds_append(g,"time_value",_f64(or_["tv"])); self._ds_append(g,"time_uncertainty",_f64(or_["tu"]))
+                self._ds_append(g,"time_lower_unc",_f64(or_["tlo"])); self._ds_append(g,"time_upper_unc",_f64(or_["thi"]))
+                self._ds_append(g,"time_conf",_f64(or_["tcf"]))
+                self._ds_append(g,"lat_value",_f64(or_["lav"])); self._ds_append(g,"lat_uncertainty",_f64(or_["lau"]))
+                self._ds_append(g,"lat_lower_unc",_f64(or_["lalo"])); self._ds_append(g,"lat_upper_unc",_f64(or_["lahi"]))
+                self._ds_append(g,"lat_conf",_f64(or_["lacf"]))
+                self._ds_append(g,"lon_value",_f64(or_["lov"])); self._ds_append(g,"lon_uncertainty",_f64(or_["lou"]))
+                self._ds_append(g,"lon_lower_unc",_f64(or_["lolo"])); self._ds_append(g,"lon_upper_unc",_f64(or_["lohi"]))
+                self._ds_append(g,"lon_conf",_f64(or_["locf"]))
+                self._ds_append(g,"depth_value",_f64(or_["dpv"])); self._ds_append(g,"depth_uncertainty",_f64(or_["dpu"]))
+                self._ds_append(g,"depth_lower_unc",_f64(or_["dplo"])); self._ds_append(g,"depth_upper_unc",_f64(or_["dphi"]))
+                self._ds_append(g,"depth_conf",_f64(or_["dpcf"]))
+                self._ds_append(g,"depth_type",_u8(or_["dtype"]),enum_map=ORIGIN_DEPTH_TYPE)
+                self._ds_append(g,"time_fixed",_i8(or_["tfx"])); self._ds_append(g,"epicenter_fixed",_i8(or_["epfx"]))
+                self._ds_append(g,"ref_system_id",self._sa(or_["rsid"]))
+                self._ds_append(g,"method_id",self._sa(or_["mid"]))
+                self._ds_append(g,"earth_model_id",self._sa(or_["emid"]))
+                self._ds_append(g,"type",_u8(or_["otype"]),enum_map=ORIGIN_TYPE)
+                self._ds_append(g,"region",self._sa(or_["reg"]))
+                self._ds_append(g,"eval_mode",_u8(or_["emode"]),enum_map=EVALUATION_MODE)
+                self._ds_append(g,"eval_status",_u8(or_["estat"]),enum_map=EVALUATION_STATUS)
+                self._ds_append(g,"ci_idx",_i32(or_["ci"]))
+                self._ds_append(g,"quality_idx",_i32(or_["qidx"])); self._ds_append(g,"uncertainty_idx",_i32(or_["uidx"]))
+                self._ds_append(g,"arrival_offset",_u32(or_["aoff"])); self._ds_append(g,"arrival_count",_u32(or_["acnt"]))
+                self._ds_append(g,"comment_offset",_u32(or_["coff"])); self._ds_append(g,"comment_count",_u32(or_["ccnt"]))
+                self._ds_append(g,"comptime_offset",_u32(or_["ctoff"])); self._ds_append(g,"comptime_count",_u32(or_["ctcnt"]))
+                for k in or_: or_[k].clear()
+
+            if oq["apc"]:
+                g=_g("origin_quality")
+                n=len(oq["apc"])
+                self._ds_append(g,"assoc_phase_count",_i32(oq["apc"])); self._ds_append(g,"used_phase_count",_i32(oq["upc"]))
+                self._ds_append(g,"assoc_sta_count",_i32(oq["asc"])); self._ds_append(g,"used_sta_count",_i32(oq["usc"]))
+                self._ds_append(g,"depth_phase_count",_i32(oq["dpc"])); self._ds_append(g,"standard_error",_f64(oq["se"]))
+                self._ds_append(g,"azimuthal_gap",_f64(oq["ag"])); self._ds_append(g,"sec_azimuthal_gap",_f64(oq["sag"]))
+                self._ds_append(g,"ground_truth_level",self._sa(oq["gtl"]))
+                self._ds_append(g,"minimum_distance",_f64(oq["mind"])); self._ds_append(g,"maximum_distance",_f64(oq["maxd"]))
+                self._ds_append(g,"median_distance",_f64(oq["medd"]))
+                self._n_oq_written+=n
+                for k in oq: oq[k].clear()
+
+            if ou["hu"]:
+                g=_g("origin_uncertainty")
+                n=len(ou["hu"])
+                self._ds_append(g,"horizontal_uncertainty",_f64(ou["hu"]))
+                self._ds_append(g,"min_horizontal_uncertainty",_f64(ou["minu"]))
+                self._ds_append(g,"max_horizontal_uncertainty",_f64(ou["maxu"]))
+                self._ds_append(g,"azimuth_max_horiz_unc",_f64(ou["az"]))
+                self._ds_append(g,"preferred_description",_u8(ou["pd"]),enum_map=ORIGIN_UNCERTAINTY_DESC)
+                self._ds_append(g,"confidence_level",_f64(ou["cl"]))
+                self._ds_append(g,"ellipsoid_idx",_i32(ou["eidx"]))
+                self._n_ou_written+=n
+                for k in ou: ou[k].clear()
+
+            if ce["sma"]:
+                g=_g("confidence_ellipsoids")
+                n=len(ce["sma"])
+                self._ds_append(g,"semi_major_axis_length",_f64(ce["sma"]))
+                self._ds_append(g,"semi_minor_axis_length",_f64(ce["smi"]))
+                self._ds_append(g,"semi_intermediate_axis_length",_f64(ce["smia"]))
+                self._ds_append(g,"major_axis_plunge",_f64(ce["mpl"]))
+                self._ds_append(g,"major_axis_azimuth",_f64(ce["maz"]))
+                self._ds_append(g,"major_axis_rotation",_f64(ce["mro"]))
+                self._n_ce_written+=n
+                for k in ce: ce[k].clear()
+
+            if ct["yrv"]:
+                g=_g("composite_times")
+                n=len(ct["yrv"])
+                for k,nm in [("yrv","year_value"),("yru","year_unc"),
+                            ("yrlo","year_lower_unc"),("yrhi","year_upper_unc"),
+                            ("mov","month_value"),("mou","month_unc"),
+                            ("molo","month_lower_unc"),("mohi","month_upper_unc"),
+                            ("dyv","day_value"),("dyu","day_unc"),
+                            ("dylo","day_lower_unc"),("dyhi","day_upper_unc"),
+                            ("hrv","hour_value"),("hru","hour_unc"),
+                            ("hrlo","hour_lower_unc"),("hrhi","hour_upper_unc"),
+                            ("miv","minute_value"),("miu","minute_unc"),
+                            ("milo","minute_lower_unc"),("mihi","minute_upper_unc")]:
+                    self._ds_append(g,nm,_i32(ct[k]))
+                for k,nm in [("yrcf","year_conf"),("mocf","month_conf"),("dycf","day_conf"),
+                            ("hrcf","hour_conf"),("micf","minute_conf"),
+                            ("sev","second_value"),("seu","second_unc"),
+                            ("selo","second_lower_unc"),("sehi","second_upper_unc"),
+                            ("secf","second_conf")]:
+                    self._ds_append(g,nm,_f64(ct[k]))
+                self._n_ct_written+=n
+                for k in ct: ct[k].clear()
+
+            if ar["pid"]:
+                g=_g("arrivals")
+                n=len(ar["pid"])
+                self._ds_append(g,"public_id",self._sa(ar["pid"])); self._ds_append(g,"pick_id",self._sa(ar["pkid"]))
+                self._ds_append(g,"phase",self._sa(ar["ph"]))
+                self._ds_append(g,"time_correction",_f64(ar["tc"])); self._ds_append(g,"azimuth",_f64(ar["az"]))
+                self._ds_append(g,"distance",_f64(ar["dist"]))
+                self._ds_append(g,"takeoff_value",_f64(ar["tov"])); self._ds_append(g,"takeoff_uncertainty",_f64(ar["tou"]))
+                self._ds_append(g,"time_residual",_f64(ar["tr"])); self._ds_append(g,"hslow_residual",_f64(ar["hsr"]))
+                self._ds_append(g,"baz_residual",_f64(ar["br"])); self._ds_append(g,"time_weight",_f64(ar["tw"]))
+                self._ds_append(g,"hslow_weight",_f64(ar["hsw"])); self._ds_append(g,"baz_weight",_f64(ar["bw"]))
+                self._ds_append(g,"earth_model_id",self._sa(ar["emid"]))
+                self._ds_append(g,"ci_idx",_i32(ar["ci"]))
+                self._ds_append(g,"comment_offset",_u32(ar["coff"])); self._ds_append(g,"comment_count",_u32(ar["ccnt"]))
+                self._n_ar_written+=n
+                for k in ar: ar[k].clear()
+
+            if mg["pid"]:
+                g=_g("magnitudes")
+                self._ds_append(g,"public_id",self._sa(mg["pid"])); self._ds_append(g,"event_idx",_u32(mg["eidx"]))
+                self._ds_append(g,"mag_value",_f64(mg["val"])); self._ds_append(g,"mag_uncertainty",_f64(mg["unc"]))
+                self._ds_append(g,"mag_lower_unc",_f64(mg["lo"])); self._ds_append(g,"mag_upper_unc",_f64(mg["hi"]))
+                self._ds_append(g,"mag_conf",_f64(mg["cf"])); self._ds_append(g,"type",self._sa(mg["type"]))
+                self._ds_append(g,"origin_id",self._sa(mg["orig"])); self._ds_append(g,"method_id",self._sa(mg["mid"]))
+                self._ds_append(g,"station_count",_i32(mg["scnt"])); self._ds_append(g,"azimuthal_gap",_f64(mg["ag"]))
+                self._ds_append(g,"eval_mode",_u8(mg["emode"]),enum_map=EVALUATION_MODE)
+                self._ds_append(g,"eval_status",_u8(mg["estat"]),enum_map=EVALUATION_STATUS)
+                self._ds_append(g,"ci_idx",_i32(mg["ci"]))
+                self._ds_append(g,"contrib_offset",_u32(mg["soff"])); self._ds_append(g,"contrib_count",_u32(mg["scnt2"]))
+                self._ds_append(g,"comment_offset",_u32(mg["coff"])); self._ds_append(g,"comment_count",_u32(mg["ccnt"]))
+                for k in mg: mg[k].clear()
+
+            if sm["pid"]:
+                g=_g("station_magnitudes")
+                self._ds_append(g,"public_id",self._sa(sm["pid"])); self._ds_append(g,"event_idx",_u32(sm["eidx"]))
+                self._ds_append(g,"origin_id",self._sa(sm["orig"]))
+                self._ds_append(g,"mag_value",_f64(sm["val"])); self._ds_append(g,"mag_uncertainty",_f64(sm["unc"]))
+                self._ds_append(g,"mag_lower_unc",_f64(sm["lo"])); self._ds_append(g,"mag_upper_unc",_f64(sm["hi"]))
+                self._ds_append(g,"type",self._sa(sm["type"])); self._ds_append(g,"amplitude_id",self._sa(sm["amid"]))
+                self._ds_append(g,"method_id",self._sa(sm["mid"])); self._ds_append(g,"waveform_idx",_u32(sm["wfidx"]))
+                self._ds_append(g,"ci_idx",_i32(sm["ci"]))
+                self._ds_append(g,"comment_offset",_u32(sm["coff"])); self._ds_append(g,"comment_count",_u32(sm["ccnt"]))
+                for k in sm: sm[k].clear()
+
+            if sc["smid"]:
+                g=_g("station_mag_contributions")
+                n=len(sc["smid"])
+                self._ds_append(g,"station_magnitude_id",self._sa(sc["smid"]))
+                self._ds_append(g,"residual",_f64(sc["res"])); self._ds_append(g,"weight",_f64(sc["wt"]))
+                self._n_sc_written+=n
+                for k in sc: sc[k].clear()
+
+            if pk["pid"]:
+                g=_g("picks")
+                self._ds_append(g,"public_id",self._sa(pk["pid"])); self._ds_append(g,"event_idx",_u32(pk["eidx"]))
+                self._ds_append(g,"time_value",_f64(pk["tv"])); self._ds_append(g,"time_uncertainty",_f64(pk["tu"]))
+                self._ds_append(g,"time_lower_unc",_f64(pk["tlo"])); self._ds_append(g,"time_upper_unc",_f64(pk["thi"]))
+                self._ds_append(g,"time_conf",_f64(pk["tcf"])); self._ds_append(g,"waveform_idx",_u32(pk["wfidx"]))
+                self._ds_append(g,"filter_id",self._sa(pk["fid"])); self._ds_append(g,"method_id",self._sa(pk["mid"]))
+                self._ds_append(g,"hslow_value",_f64(pk["hsv"])); self._ds_append(g,"hslow_uncertainty",_f64(pk["hsu"]))
+                self._ds_append(g,"baz_value",_f64(pk["bzv"])); self._ds_append(g,"baz_uncertainty",_f64(pk["bzu"]))
+                self._ds_append(g,"slowness_method_id",self._sa(pk["smid"]))
+                self._ds_append(g,"onset",_u8(pk["onset"]),enum_map=PICK_ONSET)
+                self._ds_append(g,"phase_hint",self._sa(pk["ph"]))
+                self._ds_append(g,"polarity",_u8(pk["pol"]),enum_map=PICK_POLARITY)
+                self._ds_append(g,"eval_mode",_u8(pk["emode"]),enum_map=EVALUATION_MODE)
+                self._ds_append(g,"eval_status",_u8(pk["estat"]),enum_map=EVALUATION_STATUS)
+                self._ds_append(g,"ci_idx",_i32(pk["ci"]))
+                self._ds_append(g,"comment_offset",_u32(pk["coff"])); self._ds_append(g,"comment_count",_u32(pk["ccnt"]))
+                for k in pk: pk[k].clear()
+
+            if am["pid"]:
+                g=_g("amplitudes")
+                self._ds_append(g,"public_id",self._sa(am["pid"])); self._ds_append(g,"event_idx",_u32(am["eidx"]))
+                self._ds_append(g,"amp_value",_f64(am["val"])); self._ds_append(g,"amp_uncertainty",_f64(am["unc"]))
+                self._ds_append(g,"amp_lower_unc",_f64(am["lo"])); self._ds_append(g,"amp_upper_unc",_f64(am["hi"]))
+                self._ds_append(g,"amp_conf",_f64(am["cf"])); self._ds_append(g,"type",self._sa(am["type"]))
+                self._ds_append(g,"category",_u8(am["cat"]),enum_map=AMPLITUDE_CATEGORY)
+                self._ds_append(g,"unit",_u8(am["unit"]),enum_map=AMPLITUDE_UNIT)
+                self._ds_append(g,"method_id",self._sa(am["mid"]))
+                self._ds_append(g,"period_value",_f64(am["perv"])); self._ds_append(g,"period_uncertainty",_f64(am["peru"]))
+                self._ds_append(g,"snr",_f64(am["snr"])); self._ds_append(g,"time_window_idx",_i32(am["twidx"]))
+                self._ds_append(g,"pick_id",self._sa(am["pkid"])); self._ds_append(g,"waveform_idx",_u32(am["wfidx"]))
+                self._ds_append(g,"filter_id",self._sa(am["fid"]))
+                self._ds_append(g,"scaling_time_value",_f64(am["stv"])); self._ds_append(g,"scaling_time_unc",_f64(am["stu"]))
+                self._ds_append(g,"magnitude_hint",self._sa(am["mhint"]))
+                self._ds_append(g,"eval_mode",_u8(am["emode"]),enum_map=EVALUATION_MODE)
+                self._ds_append(g,"eval_status",_u8(am["estat"]),enum_map=EVALUATION_STATUS)
+                self._ds_append(g,"ci_idx",_i32(am["ci"]))
+                self._ds_append(g,"comment_offset",_u32(am["coff"])); self._ds_append(g,"comment_count",_u32(am["ccnt"]))
+                for k in am: am[k].clear()
+
+            if tw["beg"]:
+                g=_g("time_windows")
+                n=len(tw["beg"])
+                self._ds_append(g,"begin",_f64(tw["beg"])); self._ds_append(g,"end",_f64(tw["end"]))
+                self._ds_append(g,"reference",_f64(tw["ref"]))
+                self._n_tw_written+=n
+                for k in tw: tw[k].clear()
+
+            if fm["pid"]:
+                g=_g("focal_mechanisms")
+                self._ds_append(g,"public_id",self._sa(fm["pid"])); self._ds_append(g,"event_idx",_u32(fm["eidx"]))
+                self._ds_append(g,"triggering_origin_id",self._sa(fm["toid"]))
+                for k,nm in [("np1sv","np1_strike_value"),("np1su","np1_strike_unc"),
+                            ("np1dv","np1_dip_value"),("np1du","np1_dip_unc"),
+                            ("np1rv","np1_rake_value"),("np1ru","np1_rake_unc"),
+                            ("np2sv","np2_strike_value"),("np2su","np2_strike_unc"),
+                            ("np2dv","np2_dip_value"),("np2du","np2_dip_unc"),
+                            ("np2rv","np2_rake_value"),("np2ru","np2_rake_unc")]:
+                    self._ds_append(g,nm,_f64(fm[k]))
+                self._ds_append(g,"preferred_plane",_u8(fm["pp"]))
+                for k,nm in [("tazv","t_azimuth_value"),("tazu","t_azimuth_unc"),
+                            ("tplv","t_plunge_value"),("tplu","t_plunge_unc"),
+                            ("tlnv","t_length_value"),("tlnu","t_length_unc"),
+                            ("pazv","p_azimuth_value"),("pazu","p_azimuth_unc"),
+                            ("pplv","p_plunge_value"),("pplu","p_plunge_unc"),
+                            ("plnv","p_length_value"),("plnu","p_length_unc"),
+                            ("nazv","n_azimuth_value"),("nazu","n_azimuth_unc"),
+                            ("nplv","n_plunge_value"),("nplu","n_plunge_unc"),
+                            ("nlnv","n_length_value"),("nlnu","n_length_unc")]:
+                    self._ds_append(g,nm,_f64(fm[k]))
+                self._ds_append(g,"azimuthal_gap",_f64(fm["ag"]))
+                self._ds_append(g,"station_polarity_count",_i32(fm["spc"]))
+                self._ds_append(g,"misfit",_f64(fm["mft"])); self._ds_append(g,"station_dist_ratio",_f64(fm["sdr"]))
+                self._ds_append(g,"method_id",self._sa(fm["mid"]))
+                self._ds_append(g,"eval_mode",_u8(fm["emode"]),enum_map=EVALUATION_MODE)
+                self._ds_append(g,"eval_status",_u8(fm["estat"]),enum_map=EVALUATION_STATUS)
+                self._ds_append(g,"ci_idx",_i32(fm["ci"])); self._ds_append(g,"mt_idx",_i32(fm["mtidx"]))
+                self._ds_append(g,"comment_offset",_u32(fm["coff"])); self._ds_append(g,"comment_count",_u32(fm["ccnt"]))
+                self._ds_append(g,"waveform_pool_offset",_u32(fm["wpoff"]))
+                self._ds_append(g,"waveform_pool_count",_u32(fm["wpcnt"]))
+                for k in fm: fm[k].clear()
+            if fmwp:
+                g=_g("focal_mechanisms")
+                n=len(fmwp)
+                self._ds_append(g,"waveform_pool",np.array(fmwp,dtype=np.uint32))
+                self._n_fmwp_written+=n
+                fmwp.clear()
+
+            if mt["pid"]:
+                g=_g("moment_tensors")
+                n=len(mt["pid"])
+                self._ds_append(g,"public_id",self._sa(mt["pid"]))
+                self._ds_append(g,"derived_origin_id",self._sa(mt["doid"]))
+                self._ds_append(g,"moment_mag_id",self._sa(mt["mmid"]))
+                self._ds_append(g,"scalar_moment_value",_f64(mt["scv"])); self._ds_append(g,"scalar_moment_unc",_f64(mt["scu"]))
+                for short in ("rr","tt","pp","rt","rp","tp"):
+                    self._ds_append(g,f"{short}_value",_f64(mt[f"{short}_v"]))
+                    self._ds_append(g,f"{short}_unc",  _f64(mt[f"{short}_u"]))
+                self._ds_append(g,"variance",_f64(mt["var"])); self._ds_append(g,"variance_reduction",_f64(mt["vr"]))
+                self._ds_append(g,"double_couple",_f64(mt["dc"])); self._ds_append(g,"clvd",_f64(mt["clvd"]))
+                self._ds_append(g,"iso",_f64(mt["iso"]))
+                self._ds_append(g,"greens_function_id",self._sa(mt["gfid"]))
+                self._ds_append(g,"filter_id",self._sa(mt["fid"]))
+                self._ds_append(g,"stf_type",_u8(mt["stft"]),enum_map=SOURCE_TIME_FUNC_TYPE)
+                self._ds_append(g,"stf_duration",_f64(mt["stfd"])); self._ds_append(g,"stf_rise_time",_f64(mt["stfr"]))
+                self._ds_append(g,"stf_decay_time",_f64(mt["stfdc"]))
+                self._ds_append(g,"method_id",self._sa(mt["mid"]))
+                self._ds_append(g,"category",_u8(mt["cat"]),enum_map=MT_CATEGORY)
+                self._ds_append(g,"inversion_type",_u8(mt["inv"]),enum_map=MT_INVERSION_TYPE)
+                self._ds_append(g,"ci_idx",_i32(mt["ci"]))
+                self._ds_append(g,"data_used_offset",_u32(mt["duoff"])); self._ds_append(g,"data_used_count",_u32(mt["ducnt"]))
+                self._ds_append(g,"comment_offset",_u32(mt["coff"])); self._ds_append(g,"comment_count",_u32(mt["ccnt"]))
+                self._n_mt_written+=n
+                for k in mt: mt[k].clear()
+
+            if du["wt"]:
+                g=_g("data_used")
+                n=len(du["wt"])
+                self._ds_append(g,"wave_type",_u8(du["wt"]),enum_map=DATA_USED_WAVE_TYPE)
+                self._ds_append(g,"station_count",_i32(du["sc"])); self._ds_append(g,"component_count",_i32(du["cc"]))
+                self._ds_append(g,"shortest_period",_f64(du["sp"])); self._ds_append(g,"longest_period",_f64(du["lp"]))
+                self._n_du_written+=n
+                for k in du: du[k].clear()
+
+            # _ComPool tracks its own baseline + clear internally.
+            cp.flush_to(_g("comments"),self)
+
         # ---- iterate events ----
-        for eidx,e in enumerate(events):
+        # Wrap with tqdm only when explicitly enabled, tqdm is importable, and
+        # there's actually work worth tracking. Below ~100 events the write
+        # finishes in a few hundred ms and the bar just flashes by.
+        if progress and TQDM_AVAILABLE and len(events) > 100:
+            event_iter = enumerate(tqdm(events, desc="Writing events",
+                                        unit="event", leave=False))
+        else:
+            event_iter = enumerate(events)
+        for eidx,e in event_iter:
             descs=getattr(e,"event_descriptions",[]) or []
-            doff=len(ed["text"])
+            doff=self._n_ed_written+len(ed["text"])
             for d in descs:
                 ed["text"].append(d.text or "")
                 ed["type"].append(_enc(d.type,_R_EDT))
@@ -395,7 +785,7 @@ class QMLH5:
                 # flat ints and `second` as a flat float, with optional
                 # `<field>_errors` QuantityError objects holding uncertainty,
                 # lower_uncertainty, upper_uncertainty, and confidence_level.
-                ctoff=len(ct["yrv"])
+                ctoff=self._n_ct_written+len(ct["yrv"])
                 for c_t in (getattr(o,"composite_times",[]) or []):
                     def _ctv(attr):
                         v=getattr(c_t,attr,None)
@@ -435,10 +825,10 @@ class QMLH5:
                     ct["selo"].append(_sef("lower_uncertainty"))
                     ct["sehi"].append(_sef("upper_uncertainty"))
                     ct["secf"].append(_sef("confidence_level"))
-                ctcnt=len(ct["yrv"])-ctoff
+                ctcnt=(self._n_ct_written+len(ct["yrv"]))-ctoff
 
                 # arrivals
-                aroff=len(ar["pid"])
+                aroff=self._n_ar_written+len(ar["pid"])
                 for a in (o.arrivals or []):
                     acoff,accnt=cp.add(a.comments,ci)
                     ar["pid"].append(_rid(a.resource_id))
@@ -457,13 +847,13 @@ class QMLH5:
                     ar["emid"].append(_rid(a.earth_model_id))
                     ar["ci"].append(int(ci.add(a.creation_info)))
                     ar["coff"].append(acoff); ar["ccnt"].append(accnt)
-                arcnt=len(ar["pid"])-aroff
+                arcnt=(self._n_ar_written+len(ar["pid"]))-aroff
 
                 ocoff,occnt=cp.add(o.comments,ci)
 
                 # quality
                 if o.quality is not None:
-                    q=o.quality; qidx=len(oq["apc"])
+                    q=o.quality; qidx=self._n_oq_written+len(oq["apc"])
                     oq["apc"].append(_oi(q.associated_phase_count))
                     oq["upc"].append(_oi(q.used_phase_count))
                     oq["asc"].append(_oi(q.associated_station_count))
@@ -482,7 +872,7 @@ class QMLH5:
                 if o.origin_uncertainty is not None:
                     u=o.origin_uncertainty
                     if u.confidence_ellipsoid is not None:
-                        c_e=u.confidence_ellipsoid; elidx=len(ce["sma"])
+                        c_e=u.confidence_ellipsoid; elidx=self._n_ce_written+len(ce["sma"])
                         ce["sma"].append(_of(c_e.semi_major_axis_length))
                         ce["smi"].append(_of(c_e.semi_minor_axis_length))
                         ce["smia"].append(_of(c_e.semi_intermediate_axis_length))
@@ -490,7 +880,7 @@ class QMLH5:
                         ce["maz"].append(_of(c_e.major_axis_azimuth))
                         ce["mro"].append(_of(c_e.major_axis_rotation))
                     else: elidx=-1
-                    uidx=len(ou["hu"])
+                    uidx=self._n_ou_written+len(ou["hu"])
                     ou["hu"].append(_of(u.horizontal_uncertainty))
                     ou["minu"].append(_of(u.min_horizontal_uncertainty))
                     ou["maxu"].append(_of(u.max_horizontal_uncertainty))
@@ -536,11 +926,11 @@ class QMLH5:
 
             for m in (e.magnitudes or []):
                 mcoff,mccnt=cp.add(m.comments,ci)
-                soff=len(sc["smid"])
+                soff=self._n_sc_written+len(sc["smid"])
                 for s in (m.station_magnitude_contributions or []):
                     sc["smid"].append(_rid(s.station_magnitude_id))
                     sc["res"].append(_of(s.residual)); sc["wt"].append(_of(s.weight))
-                scnt=len(sc["smid"])-soff
+                scnt=(self._n_sc_written+len(sc["smid"]))-soff
                 mq=m.mag
                 mg["pid"].append(_rid(m.resource_id)); mg["eidx"].append(eidx)
                 mg["val"].append(_fv(m,"mag")); mg["unc"].append(_qeu(m,"mag"))
@@ -596,7 +986,7 @@ class QMLH5:
             for a in (e.amplitudes or []):
                 acoff,accnt=cp.add(a.comments,ci)
                 if a.time_window is not None:
-                    twidx=len(tw["beg"])
+                    twidx=self._n_tw_written+len(tw["beg"])
                     tw["beg"].append(_of(getattr(a.time_window,"begin",None)))
                     tw["end"].append(_of(getattr(a.time_window,"end",None)))
                     tw["ref"].append(_ts(getattr(a.time_window,"reference",None)))
@@ -625,26 +1015,26 @@ class QMLH5:
 
             for f_m in (e.focal_mechanisms or []):
                 fmcoff,fmccnt=cp.add(f_m.comments,ci)
-                wpoff=len(fmwp)
+                wpoff=self._n_fmwp_written+len(fmwp)
                 for wfid in (getattr(f_m,"waveform_id",[]) or []):
                     fmwp.append(int(wf.add(wfid)))
-                wpcnt=len(fmwp)-wpoff
+                wpcnt=(self._n_fmwp_written+len(fmwp))-wpoff
 
                 # moment tensor
                 mt_obj=getattr(f_m,"moment_tensor",None)
                 if isinstance(mt_obj,list): mt_obj=mt_obj[0] if mt_obj else None
                 mtidx=-1
                 if mt_obj is not None:
-                    mtidx=len(mt["pid"])
+                    mtidx=self._n_mt_written+len(mt["pid"])
                     mtcoff,mtccnt=cp.add(mt_obj.comments,ci)
-                    duoff=len(du["wt"])
+                    duoff=self._n_du_written+len(du["wt"])
                     for d_u in (mt_obj.data_used or []):
                         du["wt"].append(_enc(d_u.wave_type,_R_DU_WAVE))
                         du["sc"].append(_oi(d_u.station_count))
                         du["cc"].append(_oi(d_u.component_count))
                         du["sp"].append(_of(d_u.shortest_period))
                         du["lp"].append(_of(d_u.longest_period))
-                    ducnt=len(du["wt"])-duoff
+                    ducnt=(self._n_du_written+len(du["wt"]))-duoff
                     stf=mt_obj.source_time_function
                     mt["pid"].append(_rid(mt_obj.resource_id))
                     mt["doid"].append(_rid(mt_obj.derived_origin_id))
@@ -743,268 +1133,17 @@ class QMLH5:
                 fm["coff"].append(fmcoff); fm["ccnt"].append(fmccnt)
                 fm["wpoff"].append(wpoff); fm["wpcnt"].append(wpcnt)
 
-        # ---- flush to HDF5 ----
-        def _g(n): return f.require_group(n)
-        def _f64(lst): return np.array(lst,dtype=np.float64)
-        def _u32(lst): return np.array(lst,dtype=np.uint32)
-        def _i32(lst): return np.array(lst,dtype=np.int32)
-        def _u8(lst):  return np.array(lst,dtype=np.uint8)
-        def _i8(lst):  return np.array(lst,dtype=np.int8)
+            # Periodic chunked flush. Free per-row accumulator memory once
+            # `chunk_size` events have been processed. The dedup tables (wf,
+            # ci) stay in RAM since they grow with unique count, not row
+            # count; they're written once at the end.
+            if chunk_size and (eidx+1) % chunk_size == 0:
+                _flush_chunk()
 
-        if ev["pid"]:
-            g=_g("catalog")
-            self._ds(g,"public_id",self._sa(ev["pid"]))
-            self._ds(g,"preferred_origin_id",self._sa(ev["po"]))
-            self._ds(g,"preferred_magnitude_id",self._sa(ev["pm"]))
-            self._ds(g,"preferred_focmec_id",self._sa(ev["pf"]))
-            self._ds(g,"event_type",_u8(ev["etype"]),enum_map=EVENT_TYPE)
-            self._ds(g,"event_type_certainty",_u8(ev["ecert"]),enum_map=EVENT_TYPE_CERTAINTY)
-            self._ds(g,"ci_idx",_i32(ev["ci"]))
-            self._ds(g,"desc_offset",_u32(ev["doff"])); self._ds(g,"desc_count",_u32(ev["dcnt"]))
-            self._ds(g,"comment_offset",_u32(ev["coff"])); self._ds(g,"comment_count",_u32(ev["ccnt"]))
-
-        if ed["text"]:
-            g=_g("event_descriptions")
-            self._ds(g,"text",self._sa(ed["text"]))
-            self._ds(g,"type",_u8(ed["type"]),enum_map=EVENT_DESC_TYPE)
-
-        if or_["pid"]:
-            g=_g("origins")
-            self._ds(g,"public_id",self._sa(or_["pid"]))
-            self._ds(g,"event_idx",_u32(or_["eidx"]))
-            self._ds(g,"time_value",_f64(or_["tv"])); self._ds(g,"time_uncertainty",_f64(or_["tu"]))
-            self._ds(g,"time_lower_unc",_f64(or_["tlo"])); self._ds(g,"time_upper_unc",_f64(or_["thi"]))
-            self._ds(g,"time_conf",_f64(or_["tcf"]))
-            self._ds(g,"lat_value",_f64(or_["lav"])); self._ds(g,"lat_uncertainty",_f64(or_["lau"]))
-            self._ds(g,"lat_lower_unc",_f64(or_["lalo"])); self._ds(g,"lat_upper_unc",_f64(or_["lahi"]))
-            self._ds(g,"lat_conf",_f64(or_["lacf"]))
-            self._ds(g,"lon_value",_f64(or_["lov"])); self._ds(g,"lon_uncertainty",_f64(or_["lou"]))
-            self._ds(g,"lon_lower_unc",_f64(or_["lolo"])); self._ds(g,"lon_upper_unc",_f64(or_["lohi"]))
-            self._ds(g,"lon_conf",_f64(or_["locf"]))
-            self._ds(g,"depth_value",_f64(or_["dpv"])); self._ds(g,"depth_uncertainty",_f64(or_["dpu"]))
-            self._ds(g,"depth_lower_unc",_f64(or_["dplo"])); self._ds(g,"depth_upper_unc",_f64(or_["dphi"]))
-            self._ds(g,"depth_conf",_f64(or_["dpcf"]))
-            self._ds(g,"depth_type",_u8(or_["dtype"]),enum_map=ORIGIN_DEPTH_TYPE)
-            self._ds(g,"time_fixed",_i8(or_["tfx"])); self._ds(g,"epicenter_fixed",_i8(or_["epfx"]))
-            self._ds(g,"ref_system_id",self._sa(or_["rsid"]))
-            self._ds(g,"method_id",self._sa(or_["mid"]))
-            self._ds(g,"earth_model_id",self._sa(or_["emid"]))
-            self._ds(g,"type",_u8(or_["otype"]),enum_map=ORIGIN_TYPE)
-            self._ds(g,"region",self._sa(or_["reg"]))
-            self._ds(g,"eval_mode",_u8(or_["emode"]),enum_map=EVALUATION_MODE)
-            self._ds(g,"eval_status",_u8(or_["estat"]),enum_map=EVALUATION_STATUS)
-            self._ds(g,"ci_idx",_i32(or_["ci"]))
-            self._ds(g,"quality_idx",_i32(or_["qidx"])); self._ds(g,"uncertainty_idx",_i32(or_["uidx"]))
-            self._ds(g,"arrival_offset",_u32(or_["aoff"])); self._ds(g,"arrival_count",_u32(or_["acnt"]))
-            self._ds(g,"comment_offset",_u32(or_["coff"])); self._ds(g,"comment_count",_u32(or_["ccnt"]))
-            self._ds(g,"comptime_offset",_u32(or_["ctoff"])); self._ds(g,"comptime_count",_u32(or_["ctcnt"]))
-
-        if oq["apc"]:
-            g=_g("origin_quality")
-            self._ds(g,"assoc_phase_count",_i32(oq["apc"])); self._ds(g,"used_phase_count",_i32(oq["upc"]))
-            self._ds(g,"assoc_sta_count",_i32(oq["asc"])); self._ds(g,"used_sta_count",_i32(oq["usc"]))
-            self._ds(g,"depth_phase_count",_i32(oq["dpc"])); self._ds(g,"standard_error",_f64(oq["se"]))
-            self._ds(g,"azimuthal_gap",_f64(oq["ag"])); self._ds(g,"sec_azimuthal_gap",_f64(oq["sag"]))
-            self._ds(g,"ground_truth_level",self._sa(oq["gtl"]))
-            self._ds(g,"minimum_distance",_f64(oq["mind"])); self._ds(g,"maximum_distance",_f64(oq["maxd"]))
-            self._ds(g,"median_distance",_f64(oq["medd"]))
-
-        if ou["hu"]:
-            g=_g("origin_uncertainty")
-            self._ds(g,"horizontal_uncertainty",_f64(ou["hu"]))
-            self._ds(g,"min_horizontal_uncertainty",_f64(ou["minu"]))
-            self._ds(g,"max_horizontal_uncertainty",_f64(ou["maxu"]))
-            self._ds(g,"azimuth_max_horiz_unc",_f64(ou["az"]))
-            self._ds(g,"preferred_description",_u8(ou["pd"]),enum_map=ORIGIN_UNCERTAINTY_DESC)
-            self._ds(g,"confidence_level",_f64(ou["cl"]))
-            self._ds(g,"ellipsoid_idx",_i32(ou["eidx"]))
-
-        if ce["sma"]:
-            g=_g("confidence_ellipsoids")
-            self._ds(g,"semi_major_axis_length",_f64(ce["sma"]))
-            self._ds(g,"semi_minor_axis_length",_f64(ce["smi"]))
-            self._ds(g,"semi_intermediate_axis_length",_f64(ce["smia"]))
-            self._ds(g,"major_axis_plunge",_f64(ce["mpl"]))
-            self._ds(g,"major_axis_azimuth",_f64(ce["maz"]))
-            self._ds(g,"major_axis_rotation",_f64(ce["mro"]))
-
-        if ct["yrv"]:
-            g=_g("composite_times")
-            # signed-int columns: value + uncertainty + lower + upper (-1 = absent)
-            for k,n in [("yrv","year_value"),("yru","year_unc"),
-                        ("yrlo","year_lower_unc"),("yrhi","year_upper_unc"),
-                        ("mov","month_value"),("mou","month_unc"),
-                        ("molo","month_lower_unc"),("mohi","month_upper_unc"),
-                        ("dyv","day_value"),("dyu","day_unc"),
-                        ("dylo","day_lower_unc"),("dyhi","day_upper_unc"),
-                        ("hrv","hour_value"),("hru","hour_unc"),
-                        ("hrlo","hour_lower_unc"),("hrhi","hour_upper_unc"),
-                        ("miv","minute_value"),("miu","minute_unc"),
-                        ("milo","minute_lower_unc"),("mihi","minute_upper_unc")]:
-                self._ds(g,n,_i32(ct[k]))
-            # float columns: confidence_level for each int field, plus all four
-            # error sub-fields for `second` (which is itself a float)
-            for k,n in [("yrcf","year_conf"),("mocf","month_conf"),("dycf","day_conf"),
-                        ("hrcf","hour_conf"),("micf","minute_conf"),
-                        ("sev","second_value"),("seu","second_unc"),
-                        ("selo","second_lower_unc"),("sehi","second_upper_unc"),
-                        ("secf","second_conf")]:
-                self._ds(g,n,_f64(ct[k]))
-
-        if ar["pid"]:
-            g=_g("arrivals")
-            self._ds(g,"public_id",self._sa(ar["pid"])); self._ds(g,"pick_id",self._sa(ar["pkid"]))
-            self._ds(g,"phase",self._sa(ar["ph"]))
-            self._ds(g,"time_correction",_f64(ar["tc"])); self._ds(g,"azimuth",_f64(ar["az"]))
-            self._ds(g,"distance",_f64(ar["dist"]))
-            self._ds(g,"takeoff_value",_f64(ar["tov"])); self._ds(g,"takeoff_uncertainty",_f64(ar["tou"]))
-            self._ds(g,"time_residual",_f64(ar["tr"])); self._ds(g,"hslow_residual",_f64(ar["hsr"]))
-            self._ds(g,"baz_residual",_f64(ar["br"])); self._ds(g,"time_weight",_f64(ar["tw"]))
-            self._ds(g,"hslow_weight",_f64(ar["hsw"])); self._ds(g,"baz_weight",_f64(ar["bw"]))
-            self._ds(g,"earth_model_id",self._sa(ar["emid"]))
-            self._ds(g,"ci_idx",_i32(ar["ci"]))
-            self._ds(g,"comment_offset",_u32(ar["coff"])); self._ds(g,"comment_count",_u32(ar["ccnt"]))
-
-        if mg["pid"]:
-            g=_g("magnitudes")
-            self._ds(g,"public_id",self._sa(mg["pid"])); self._ds(g,"event_idx",_u32(mg["eidx"]))
-            self._ds(g,"mag_value",_f64(mg["val"])); self._ds(g,"mag_uncertainty",_f64(mg["unc"]))
-            self._ds(g,"mag_lower_unc",_f64(mg["lo"])); self._ds(g,"mag_upper_unc",_f64(mg["hi"]))
-            self._ds(g,"mag_conf",_f64(mg["cf"])); self._ds(g,"type",self._sa(mg["type"]))
-            self._ds(g,"origin_id",self._sa(mg["orig"])); self._ds(g,"method_id",self._sa(mg["mid"]))
-            self._ds(g,"station_count",_i32(mg["scnt"])); self._ds(g,"azimuthal_gap",_f64(mg["ag"]))
-            self._ds(g,"eval_mode",_u8(mg["emode"]),enum_map=EVALUATION_MODE)
-            self._ds(g,"eval_status",_u8(mg["estat"]),enum_map=EVALUATION_STATUS)
-            self._ds(g,"ci_idx",_i32(mg["ci"]))
-            self._ds(g,"contrib_offset",_u32(mg["soff"])); self._ds(g,"contrib_count",_u32(mg["scnt2"]))
-            self._ds(g,"comment_offset",_u32(mg["coff"])); self._ds(g,"comment_count",_u32(mg["ccnt"]))
-
-        if sm["pid"]:
-            g=_g("station_magnitudes")
-            self._ds(g,"public_id",self._sa(sm["pid"])); self._ds(g,"event_idx",_u32(sm["eidx"]))
-            self._ds(g,"origin_id",self._sa(sm["orig"]))
-            self._ds(g,"mag_value",_f64(sm["val"])); self._ds(g,"mag_uncertainty",_f64(sm["unc"]))
-            self._ds(g,"mag_lower_unc",_f64(sm["lo"])); self._ds(g,"mag_upper_unc",_f64(sm["hi"]))
-            self._ds(g,"type",self._sa(sm["type"])); self._ds(g,"amplitude_id",self._sa(sm["amid"]))
-            self._ds(g,"method_id",self._sa(sm["mid"])); self._ds(g,"waveform_idx",_u32(sm["wfidx"]))
-            self._ds(g,"ci_idx",_i32(sm["ci"]))
-            self._ds(g,"comment_offset",_u32(sm["coff"])); self._ds(g,"comment_count",_u32(sm["ccnt"]))
-
-        if sc["smid"]:
-            g=_g("station_mag_contributions")
-            self._ds(g,"station_magnitude_id",self._sa(sc["smid"]))
-            self._ds(g,"residual",_f64(sc["res"])); self._ds(g,"weight",_f64(sc["wt"]))
-
-        if pk["pid"]:
-            g=_g("picks")
-            self._ds(g,"public_id",self._sa(pk["pid"])); self._ds(g,"event_idx",_u32(pk["eidx"]))
-            self._ds(g,"time_value",_f64(pk["tv"])); self._ds(g,"time_uncertainty",_f64(pk["tu"]))
-            self._ds(g,"time_lower_unc",_f64(pk["tlo"])); self._ds(g,"time_upper_unc",_f64(pk["thi"]))
-            self._ds(g,"time_conf",_f64(pk["tcf"])); self._ds(g,"waveform_idx",_u32(pk["wfidx"]))
-            self._ds(g,"filter_id",self._sa(pk["fid"])); self._ds(g,"method_id",self._sa(pk["mid"]))
-            self._ds(g,"hslow_value",_f64(pk["hsv"])); self._ds(g,"hslow_uncertainty",_f64(pk["hsu"]))
-            self._ds(g,"baz_value",_f64(pk["bzv"])); self._ds(g,"baz_uncertainty",_f64(pk["bzu"]))
-            self._ds(g,"slowness_method_id",self._sa(pk["smid"]))
-            self._ds(g,"onset",_u8(pk["onset"]),enum_map=PICK_ONSET)
-            self._ds(g,"phase_hint",self._sa(pk["ph"]))
-            self._ds(g,"polarity",_u8(pk["pol"]),enum_map=PICK_POLARITY)
-            self._ds(g,"eval_mode",_u8(pk["emode"]),enum_map=EVALUATION_MODE)
-            self._ds(g,"eval_status",_u8(pk["estat"]),enum_map=EVALUATION_STATUS)
-            self._ds(g,"ci_idx",_i32(pk["ci"]))
-            self._ds(g,"comment_offset",_u32(pk["coff"])); self._ds(g,"comment_count",_u32(pk["ccnt"]))
-
-        if am["pid"]:
-            g=_g("amplitudes")
-            self._ds(g,"public_id",self._sa(am["pid"])); self._ds(g,"event_idx",_u32(am["eidx"]))
-            self._ds(g,"amp_value",_f64(am["val"])); self._ds(g,"amp_uncertainty",_f64(am["unc"]))
-            self._ds(g,"amp_lower_unc",_f64(am["lo"])); self._ds(g,"amp_upper_unc",_f64(am["hi"]))
-            self._ds(g,"amp_conf",_f64(am["cf"])); self._ds(g,"type",self._sa(am["type"]))
-            self._ds(g,"category",_u8(am["cat"]),enum_map=AMPLITUDE_CATEGORY)
-            self._ds(g,"unit",_u8(am["unit"]),enum_map=AMPLITUDE_UNIT)
-            self._ds(g,"method_id",self._sa(am["mid"]))
-            self._ds(g,"period_value",_f64(am["perv"])); self._ds(g,"period_uncertainty",_f64(am["peru"]))
-            self._ds(g,"snr",_f64(am["snr"])); self._ds(g,"time_window_idx",_i32(am["twidx"]))
-            self._ds(g,"pick_id",self._sa(am["pkid"])); self._ds(g,"waveform_idx",_u32(am["wfidx"]))
-            self._ds(g,"filter_id",self._sa(am["fid"]))
-            self._ds(g,"scaling_time_value",_f64(am["stv"])); self._ds(g,"scaling_time_unc",_f64(am["stu"]))
-            self._ds(g,"magnitude_hint",self._sa(am["mhint"]))
-            self._ds(g,"eval_mode",_u8(am["emode"]),enum_map=EVALUATION_MODE)
-            self._ds(g,"eval_status",_u8(am["estat"]),enum_map=EVALUATION_STATUS)
-            self._ds(g,"ci_idx",_i32(am["ci"]))
-            self._ds(g,"comment_offset",_u32(am["coff"])); self._ds(g,"comment_count",_u32(am["ccnt"]))
-
-        if tw["beg"]:
-            g=_g("time_windows")
-            self._ds(g,"begin",_f64(tw["beg"])); self._ds(g,"end",_f64(tw["end"]))
-            self._ds(g,"reference",_f64(tw["ref"]))
-
-        if fm["pid"]:
-            g=_g("focal_mechanisms")
-            self._ds(g,"public_id",self._sa(fm["pid"])); self._ds(g,"event_idx",_u32(fm["eidx"]))
-            self._ds(g,"triggering_origin_id",self._sa(fm["toid"]))
-            for k,n in [("np1sv","np1_strike_value"),("np1su","np1_strike_unc"),
-                        ("np1dv","np1_dip_value"),("np1du","np1_dip_unc"),
-                        ("np1rv","np1_rake_value"),("np1ru","np1_rake_unc"),
-                        ("np2sv","np2_strike_value"),("np2su","np2_strike_unc"),
-                        ("np2dv","np2_dip_value"),("np2du","np2_dip_unc"),
-                        ("np2rv","np2_rake_value"),("np2ru","np2_rake_unc")]:
-                self._ds(g,n,_f64(fm[k]))
-            self._ds(g,"preferred_plane",_u8(fm["pp"]))
-            for k,n in [("tazv","t_azimuth_value"),("tazu","t_azimuth_unc"),
-                        ("tplv","t_plunge_value"),("tplu","t_plunge_unc"),
-                        ("tlnv","t_length_value"),("tlnu","t_length_unc"),
-                        ("pazv","p_azimuth_value"),("pazu","p_azimuth_unc"),
-                        ("pplv","p_plunge_value"),("pplu","p_plunge_unc"),
-                        ("plnv","p_length_value"),("plnu","p_length_unc"),
-                        ("nazv","n_azimuth_value"),("nazu","n_azimuth_unc"),
-                        ("nplv","n_plunge_value"),("nplu","n_plunge_unc"),
-                        ("nlnv","n_length_value"),("nlnu","n_length_unc")]:
-                self._ds(g,n,_f64(fm[k]))
-            self._ds(g,"azimuthal_gap",_f64(fm["ag"]))
-            self._ds(g,"station_polarity_count",_i32(fm["spc"]))
-            self._ds(g,"misfit",_f64(fm["mft"])); self._ds(g,"station_dist_ratio",_f64(fm["sdr"]))
-            self._ds(g,"method_id",self._sa(fm["mid"]))
-            self._ds(g,"eval_mode",_u8(fm["emode"]),enum_map=EVALUATION_MODE)
-            self._ds(g,"eval_status",_u8(fm["estat"]),enum_map=EVALUATION_STATUS)
-            self._ds(g,"ci_idx",_i32(fm["ci"])); self._ds(g,"mt_idx",_i32(fm["mtidx"]))
-            self._ds(g,"comment_offset",_u32(fm["coff"])); self._ds(g,"comment_count",_u32(fm["ccnt"]))
-            self._ds(g,"waveform_pool_offset",_u32(fm["wpoff"]))
-            self._ds(g,"waveform_pool_count",_u32(fm["wpcnt"]))
-            self._ds(g,"waveform_pool",np.array(fmwp,dtype=np.uint32) if fmwp else np.array([],dtype=np.uint32))
-
-        if mt["pid"]:
-            g=_g("moment_tensors")
-            self._ds(g,"public_id",self._sa(mt["pid"]))
-            self._ds(g,"derived_origin_id",self._sa(mt["doid"]))
-            self._ds(g,"moment_mag_id",self._sa(mt["mmid"]))
-            self._ds(g,"scalar_moment_value",_f64(mt["scv"])); self._ds(g,"scalar_moment_unc",_f64(mt["scu"]))
-            for short in ("rr","tt","pp","rt","rp","tp"):
-                self._ds(g,f"{short}_value",_f64(mt[f"{short}_v"]))
-                self._ds(g,f"{short}_unc",  _f64(mt[f"{short}_u"]))
-            self._ds(g,"variance",_f64(mt["var"])); self._ds(g,"variance_reduction",_f64(mt["vr"]))
-            self._ds(g,"double_couple",_f64(mt["dc"])); self._ds(g,"clvd",_f64(mt["clvd"]))
-            self._ds(g,"iso",_f64(mt["iso"]))
-            self._ds(g,"greens_function_id",self._sa(mt["gfid"]))
-            self._ds(g,"filter_id",self._sa(mt["fid"]))
-            self._ds(g,"stf_type",_u8(mt["stft"]),enum_map=SOURCE_TIME_FUNC_TYPE)
-            self._ds(g,"stf_duration",_f64(mt["stfd"])); self._ds(g,"stf_rise_time",_f64(mt["stfr"]))
-            self._ds(g,"stf_decay_time",_f64(mt["stfdc"]))
-            self._ds(g,"method_id",self._sa(mt["mid"]))
-            self._ds(g,"category",_u8(mt["cat"]),enum_map=MT_CATEGORY)
-            self._ds(g,"inversion_type",_u8(mt["inv"]),enum_map=MT_INVERSION_TYPE)
-            self._ds(g,"ci_idx",_i32(mt["ci"]))
-            self._ds(g,"data_used_offset",_u32(mt["duoff"])); self._ds(g,"data_used_count",_u32(mt["ducnt"]))
-            self._ds(g,"comment_offset",_u32(mt["coff"])); self._ds(g,"comment_count",_u32(mt["ccnt"]))
-
-        if du["wt"]:
-            g=_g("data_used")
-            self._ds(g,"wave_type",_u8(du["wt"]),enum_map=DATA_USED_WAVE_TYPE)
-            self._ds(g,"station_count",_i32(du["sc"])); self._ds(g,"component_count",_i32(du["cc"]))
-            self._ds(g,"shortest_period",_f64(du["sp"])); self._ds(g,"longest_period",_f64(du["lp"]))
-
+        # ---- final flush of any partial chunk, then write dedup tables ----
+        _flush_chunk()
         wf.write(_g("waveform_ids"),self._CS)
         ci.write(_g("creation_info"),self._C,self._CS)
-        cp.write(_g("comments"),self._C,self._CS)
 
     # ------------------------------------------------------------------
     # READ PATH
@@ -1022,6 +1161,58 @@ class QMLH5:
         if r.dtype.kind=="O":
             return np.array([v.decode() if isinstance(v,bytes) else (v or "") for v in r])
         return r
+
+    # ------------------------------------------------------------------
+    # Read-path acceleration: prefetch every column of a group once and
+    # precompute per-event row slices. The previous design called
+    # `g["col"][()]` (a full HDF5 dataset read + decode) inside per-event
+    # loops, giving O(events × columns) full-column reads. The new design
+    # loads each column exactly once and looks up event slices in O(1) via
+    # boundary arrays built from the (sorted) `event_idx` column.
+    # ------------------------------------------------------------------
+    def _prefetch_group(self, name):
+        """Load every column of an HDF5 group into a dict[name -> ndarray].
+        String columns are decoded once here, not per row at access time.
+        Returns None if the group is absent or empty."""
+        g = self._grp(name)
+        if g is None: return None
+        cols = {}
+        for k in g.keys():
+            v = g[k][()]
+            if v.dtype.kind == "O":   # object array of bytes / str
+                v = np.array([x.decode() if isinstance(x, bytes) else (x or "")
+                              for x in v])
+            cols[k] = v
+        return cols if cols else None
+
+    @staticmethod
+    def _build_event_slices(cols, n_events):
+        """Given a prefetched group's columns, return (starts, ends) arrays of
+        shape (n_events,) such that rows[starts[ei]:ends[ei]] is the slice of
+        rows belonging to event ei. Assumes `event_idx` is sorted ascending,
+        which the writer guarantees (events are accumulated in order and
+        chunks are flushed in order). Falls back to per-event np.where for
+        groups whose event_idx isn't sorted (shouldn't happen, but harmless)."""
+        if cols is None or "event_idx" not in cols:
+            return None, None
+        eidx = cols["event_idx"]
+        if len(eidx) == 0:
+            return (np.zeros(n_events, dtype=np.int64),
+                    np.zeros(n_events, dtype=np.int64))
+        # Check sortedness cheaply (vectorized).
+        if not np.all(np.diff(eidx) >= 0):
+            # Fallback: per-event np.where, still much faster than full reads
+            starts = np.empty(n_events, dtype=np.int64)
+            ends   = np.empty(n_events, dtype=np.int64)
+            for i in range(n_events):
+                m = np.where(eidx == i)[0]
+                if len(m): starts[i], ends[i] = m[0], m[-1]+1
+                else: starts[i] = ends[i] = 0
+            return starts, ends
+        idx_range = np.arange(n_events)
+        starts = np.searchsorted(eidx, idx_range, side="left")
+        ends   = np.searchsorted(eidx, idx_range, side="right")
+        return starts, ends
 
     def _load_wf(self):
         g=self._grp("waveform_ids")
@@ -1074,8 +1265,20 @@ class QMLH5:
         ev=self._ra(g,"event_idx")
         return np.array([],dtype=np.int64) if ev is None else np.where(ev==ei)[0]
 
-    def read_catalog(self,event_indices=None):
-        """Reconstruct an ObsPy Catalog. Pass event_indices to load a subset."""
+    def read_catalog(self,event_indices=None,progress=True):
+        """Reconstruct an ObsPy Catalog.
+
+        Parameters
+        ----------
+        event_indices : iterable of int, optional
+            Subset of event row indices to load. If ``None`` (default), the
+            entire catalog is loaded.
+        progress : bool, optional
+            Show a tqdm progress bar while reconstructing events. Defaults to
+            ``True``. Has no effect if tqdm is not installed, or for catalogs
+            of 100 events or fewer (where the read finishes in well under a
+            second and the bar would just flash by).
+        """
         if not OBSPY_AVAILABLE: raise ImportError("ObsPy required")
         f=self._f
         wf_rows=self._load_wf(); ci_rows=self._load_ci()
@@ -1094,11 +1297,40 @@ class QMLH5:
             doff=self._ra(cg,"desc_offset");  dcnt=self._ra(cg,"desc_count")
             coff=self._ra(cg,"comment_offset");ccnt=self._ra(cg,"comment_count")
 
-            og=self._grp("origins"); mgg=self._grp("magnitudes")
-            smg=self._grp("station_magnitudes"); pkg=self._grp("picks")
-            amg=self._grp("amplitudes"); fmg=self._grp("focal_mechanisms")
+            # Prefetch every child group's columns ONCE, and precompute the
+            # per-event row slice arrays. This collapses O(events × columns)
+            # full-column reads into O(columns) reads + O(events) lookups.
+            og_cols   = self._prefetch_group("origins")
+            mg_cols   = self._prefetch_group("magnitudes")
+            sm_cols   = self._prefetch_group("station_magnitudes")
+            pk_cols   = self._prefetch_group("picks")
+            am_cols   = self._prefetch_group("amplitudes")
+            fm_cols   = self._prefetch_group("focal_mechanisms")
+            ar_cols   = self._prefetch_group("arrivals")
+            ct_cols   = self._prefetch_group("composite_times")
+            oq_cols   = self._prefetch_group("origin_quality")
+            ou_cols   = self._prefetch_group("origin_uncertainty")
+            ce_cols   = self._prefetch_group("confidence_ellipsoids")
+            mt_cols   = self._prefetch_group("moment_tensors")
+            du_cols   = self._prefetch_group("data_used")
+            sc_cols   = self._prefetch_group("station_mag_contributions")
+            tw_cols   = self._prefetch_group("time_windows")
+            ed_cols   = self._prefetch_group("event_descriptions")
+            og_s, og_e = self._build_event_slices(og_cols, n)
+            mg_s, mg_e = self._build_event_slices(mg_cols, n)
+            sm_s, sm_e = self._build_event_slices(sm_cols, n)
+            pk_s, pk_e = self._build_event_slices(pk_cols, n)
+            am_s, am_e = self._build_event_slices(am_cols, n)
+            fm_s, fm_e = self._build_event_slices(fm_cols, n)
 
-            for ei in event_indices:
+            # Wrap with tqdm only when explicitly enabled, tqdm is importable,
+            # and the catalog is large enough that the bar isn't just noise.
+            if progress and TQDM_AVAILABLE and len(event_indices) > 100:
+                ei_iter = tqdm(event_indices, desc="Reading events",
+                               unit="event", leave=False)
+            else:
+                ei_iter = event_indices
+            for ei in ei_iter:
                 e=Event()
                 e.resource_id=_make_rid(pid[ei])
                 e.preferred_origin_id=_make_rid(po[ei])
@@ -1107,14 +1339,16 @@ class QMLH5:
                 e.event_type=_dec(ety[ei],EVENT_TYPE)
                 e.event_type_certainty=_dec(ect[ei],EVENT_TYPE_CERTAINTY)
                 e.creation_info=self._mk_ci(ci_rows,eci[ei])
-                e.event_descriptions=self._rd_descs(int(doff[ei]),int(dcnt[ei]))
+                e.event_descriptions=self._rd_descs(ed_cols,int(doff[ei]),int(dcnt[ei]))
                 e.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[ei]),int(ccnt[ei]))
-                e.origins=self._rd_origins(og,ei,ci_rows,txt,cid,cidx,wf_rows)
-                e.magnitudes=self._rd_magnitudes(mgg,ei,ci_rows,txt,cid,cidx)
-                e.station_magnitudes=self._rd_sta_mags(smg,ei,ci_rows,wf_rows,txt,cid,cidx)
-                e.picks=self._rd_picks(pkg,ei,ci_rows,wf_rows,txt,cid,cidx)
-                e.amplitudes=self._rd_amplitudes(amg,ei,ci_rows,wf_rows,txt,cid,cidx)
-                e.focal_mechanisms=self._rd_focmecs(fmg,ei,ci_rows,wf_rows,txt,cid,cidx)
+                e.origins=self._rd_origins(og_cols,og_s,og_e,ei,
+                    ar_cols,ct_cols,oq_cols,ou_cols,ce_cols,ci_rows,txt,cid,cidx)
+                e.magnitudes=self._rd_magnitudes(mg_cols,mg_s,mg_e,ei,sc_cols,ci_rows,txt,cid,cidx)
+                e.station_magnitudes=self._rd_sta_mags(sm_cols,sm_s,sm_e,ei,ci_rows,wf_rows,txt,cid,cidx)
+                e.picks=self._rd_picks(pk_cols,pk_s,pk_e,ei,ci_rows,wf_rows,txt,cid,cidx)
+                e.amplitudes=self._rd_amplitudes(am_cols,am_s,am_e,ei,tw_cols,ci_rows,wf_rows,txt,cid,cidx)
+                e.focal_mechanisms=self._rd_focmecs(fm_cols,fm_s,fm_e,ei,
+                    mt_cols,du_cols,ci_rows,wf_rows,txt,cid,cidx)
                 events.append(e)
 
         cat=Catalog(events=events)
@@ -1133,41 +1367,39 @@ class QMLH5:
             cat.comments=self._mk_comments(txt,cid,cidx,ci_rows,cat_coff,cat_ccnt)
         return cat
 
-    def _rd_descs(self,off,cnt):
-        g=self._grp("event_descriptions")
-        if g is None or cnt==0: return []
-        ta=self._rs(g,"text"); ty=self._ra(g,"type")
+    def _rd_descs(self,cols,off,cnt):
+        if cols is None or cnt==0: return []
+        ta=cols["text"]; ty=cols["type"]
         return [EventDescription(text=ta[i],type=_dec(ty[i],EVENT_DESC_TYPE))
                 for i in range(off,off+cnt)]
 
-    def _rd_origins(self,g,ei,ci_rows,txt,cid,cidx,wf_rows):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
-        def f64(k): return g[k][()]
-        def str_(k): return self._rs(g,k)
-        tv=f64("time_value"); tu=f64("time_uncertainty"); tlo=f64("time_lower_unc")
-        thi=f64("time_upper_unc"); tcf=f64("time_conf")
-        lav=f64("lat_value"); lau=f64("lat_uncertainty")
-        lalo=f64("lat_lower_unc"); lahi=f64("lat_upper_unc"); lacf=f64("lat_conf")
-        lov=f64("lon_value"); lou=f64("lon_uncertainty")
-        lolo=f64("lon_lower_unc"); lohi=f64("lon_upper_unc"); locf=f64("lon_conf")
-        dpv=f64("depth_value"); dpu=f64("depth_uncertainty")
-        dplo=f64("depth_lower_unc"); dphi=f64("depth_upper_unc"); dpcf=f64("depth_conf")
-        dtype=g["depth_type"][()]; tfx=g["time_fixed"][()]; epfx=g["epicenter_fixed"][()]
-        rsid=str_("ref_system_id"); mid=str_("method_id"); emid=str_("earth_model_id")
-        otype=g["type"][()]; reg=str_("region")
-        emode=g["eval_mode"][()]; estat=g["eval_status"][()]; ci_i=g["ci_idx"][()]
-        qidx=g["quality_idx"][()]; uidx=g["uncertainty_idx"][()]
-        aoff=g["arrival_offset"][()]; acnt=g["arrival_count"][()]
-        coff=g["comment_offset"][()]; ccnt=g["comment_count"][()]
-        ctoff=g["comptime_offset"][()]; ctcnt=g["comptime_count"][()]
-        oqg=self._grp("origin_quality"); oug=self._grp("origin_uncertainty")
-        ceg=self._grp("confidence_ellipsoids"); arg=self._grp("arrivals")
-        ctg=self._grp("composite_times")
+    def _rd_origins(self,cols,og_s,og_e,ei,ar_cols,ct_cols,oq_cols,ou_cols,ce_cols,
+                    ci_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(og_s[ei]), int(og_e[ei])
+        if start == end: return []
+        # All columns are already in memory as numpy arrays — just index.
+        pid = cols["public_id"]
+        tv  = cols["time_value"]; tu = cols["time_uncertainty"]
+        tlo = cols["time_lower_unc"]; thi = cols["time_upper_unc"]; tcf = cols["time_conf"]
+        lav = cols["lat_value"]; lau = cols["lat_uncertainty"]
+        lalo= cols["lat_lower_unc"]; lahi= cols["lat_upper_unc"]; lacf= cols["lat_conf"]
+        lov = cols["lon_value"]; lou = cols["lon_uncertainty"]
+        lolo= cols["lon_lower_unc"]; lohi= cols["lon_upper_unc"]; locf= cols["lon_conf"]
+        dpv = cols["depth_value"]; dpu = cols["depth_uncertainty"]
+        dplo= cols["depth_lower_unc"]; dphi= cols["depth_upper_unc"]; dpcf= cols["depth_conf"]
+        dtype = cols["depth_type"]; tfx = cols["time_fixed"]; epfx = cols["epicenter_fixed"]
+        rsid = cols["ref_system_id"]; mid = cols["method_id"]; emid = cols["earth_model_id"]
+        otype = cols["type"]; reg = cols["region"]
+        emode = cols["eval_mode"]; estat = cols["eval_status"]; ci_i = cols["ci_idx"]
+        qidx = cols["quality_idx"]; uidx = cols["uncertainty_idx"]
+        aoff = cols["arrival_offset"]; acnt = cols["arrival_count"]
+        coff = cols["comment_offset"]; ccnt = cols["comment_count"]
+        ctoff= cols["comptime_offset"]; ctcnt= cols["comptime_count"]
         out=[]
-        for i in idxs:
+        for i in range(start, end):
             o=Origin()
-            o.resource_id=_make_rid(str_("public_id")[i])
+            o.resource_id=_make_rid(pid[i])
             o.time=_from_ts(float(tv[i]))
             o.time_errors=QuantityError(uncertainty=_nn(tu[i]),
                 lower_uncertainty=_nn(tlo[i]),upper_uncertainty=_nn(thi[i]),
@@ -1193,18 +1425,18 @@ class QMLH5:
             o.evaluation_mode=_dec(emode[i],EVALUATION_MODE)
             o.evaluation_status=_dec(estat[i],EVALUATION_STATUS)
             o.creation_info=self._mk_ci(ci_rows,ci_i[i])
-            o.quality=self._rd_oq(oqg,int(qidx[i]))
-            o.origin_uncertainty=self._rd_ou(oug,ceg,int(uidx[i]))
-            o.arrivals=self._rd_arrivals(arg,int(aoff[i]),int(acnt[i]),ci_rows,txt,cid,cidx)
-            o.composite_times=self._rd_ct(ctg,int(ctoff[i]),int(ctcnt[i]))
+            o.quality=self._rd_oq(oq_cols,int(qidx[i]))
+            o.origin_uncertainty=self._rd_ou(ou_cols,ce_cols,int(uidx[i]))
+            o.arrivals=self._rd_arrivals(ar_cols,int(aoff[i]),int(acnt[i]),ci_rows,txt,cid,cidx)
+            o.composite_times=self._rd_ct(ct_cols,int(ctoff[i]),int(ctcnt[i]))
             o.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(o)
         return out
 
-    def _rd_oq(self,g,idx):
-        if g is None or idx<0: return None
-        def gi(k): v=int(g[k][idx]); return None if v==-1 else v
-        def gf(k): return _nn(float(g[k][idx]))
+    def _rd_oq(self,cols,idx):
+        if cols is None or idx<0: return None
+        def gi(k): v=int(cols[k][idx]); return None if v==-1 else v
+        def gf(k): return _nn(float(cols[k][idx]))
         return OriginQuality(associated_phase_count=gi("assoc_phase_count"),
             used_phase_count=gi("used_phase_count"),
             associated_station_count=gi("assoc_sta_count"),
@@ -1212,16 +1444,16 @@ class QMLH5:
             depth_phase_count=gi("depth_phase_count"),
             standard_error=gf("standard_error"),azimuthal_gap=gf("azimuthal_gap"),
             secondary_azimuthal_gap=gf("sec_azimuthal_gap"),
-            ground_truth_level=_sv(g["ground_truth_level"][idx]) or None,
+            ground_truth_level=cols["ground_truth_level"][idx] or None,
             minimum_distance=gf("minimum_distance"),maximum_distance=gf("maximum_distance"),
             median_distance=gf("median_distance"))
 
-    def _rd_ou(self,oug,ceg,idx):
-        if oug is None or idx<0: return None
-        def gf(k): return _nn(float(oug[k][idx]))
-        eidx=int(oug["ellipsoid_idx"][idx]); el=None
-        if ceg is not None and eidx>=0:
-            def cf(k): return _nn(float(ceg[k][eidx]))
+    def _rd_ou(self,ou_cols,ce_cols,idx):
+        if ou_cols is None or idx<0: return None
+        def gf(k): return _nn(float(ou_cols[k][idx]))
+        eidx=int(ou_cols["ellipsoid_idx"][idx]); el=None
+        if ce_cols is not None and eidx>=0:
+            def cf(k): return _nn(float(ce_cols[k][eidx]))
             el=ConfidenceEllipsoid()
             for attr in ("semi_major_axis_length","semi_minor_axis_length",
                          "semi_intermediate_axis_length","major_axis_plunge",
@@ -1232,40 +1464,44 @@ class QMLH5:
             min_horizontal_uncertainty=gf("min_horizontal_uncertainty"),
             max_horizontal_uncertainty=gf("max_horizontal_uncertainty"),
             azimuth_max_horizontal_uncertainty=gf("azimuth_max_horiz_unc"),
-            preferred_description=_dec(int(oug["preferred_description"][idx]),ORIGIN_UNCERTAINTY_DESC),
+            preferred_description=_dec(int(ou_cols["preferred_description"][idx]),ORIGIN_UNCERTAINTY_DESC),
             confidence_level=gf("confidence_level"),confidence_ellipsoid=el)
 
-    def _rd_arrivals(self,g,off,cnt,ci_rows,txt,cid,cidx):
-        if g is None or cnt==0: return []
+    def _rd_arrivals(self,cols,off,cnt,ci_rows,txt,cid,cidx):
+        if cols is None or cnt==0: return []
+        pid=cols["public_id"]; pkid=cols["pick_id"]; ph=cols["phase"]
+        tc=cols["time_correction"]; az=cols["azimuth"]; dist=cols["distance"]
+        tov=cols["takeoff_value"]; tou=cols["takeoff_uncertainty"]
+        tr=cols["time_residual"]; hsr=cols["hslow_residual"]; br=cols["baz_residual"]
+        tw=cols["time_weight"]; hsw=cols["hslow_weight"]; bw=cols["baz_weight"]
+        emid=cols["earth_model_id"]; ci_i=cols["ci_idx"]
+        coff=cols["comment_offset"]; ccnt=cols["comment_count"]
         out=[]
         for i in range(off,off+cnt):
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
-            ta=gf("takeoff_value")
-            ar=Arrival(resource_id=_make_rid(gs("public_id")),
-                pick_id=_make_rid(gs("pick_id")),phase=gs("phase"),
-                time_correction=gf("time_correction"),azimuth=gf("azimuth"),
-                distance=gf("distance"),takeoff_angle=ta,
-                time_residual=gf("time_residual"),
-                horizontal_slowness_residual=gf("hslow_residual"),
-                backazimuth_residual=gf("baz_residual"),
-                time_weight=gf("time_weight"),horizontal_slowness_weight=gf("hslow_weight"),
-                backazimuth_weight=gf("baz_weight"),earth_model_id=_make_rid(gs("earth_model_id")),
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
-            if ta: ar.takeoff_angle_errors=QuantityError(uncertainty=gf("takeoff_uncertainty"))
-            ar.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
+            ta=_nn(float(tov[i]))
+            ar=Arrival(resource_id=_make_rid(pid[i]),
+                pick_id=_make_rid(pkid[i]),phase=(ph[i] or None),
+                time_correction=_nn(float(tc[i])),azimuth=_nn(float(az[i])),
+                distance=_nn(float(dist[i])),takeoff_angle=ta,
+                time_residual=_nn(float(tr[i])),
+                horizontal_slowness_residual=_nn(float(hsr[i])),
+                backazimuth_residual=_nn(float(br[i])),
+                time_weight=_nn(float(tw[i])),horizontal_slowness_weight=_nn(float(hsw[i])),
+                backazimuth_weight=_nn(float(bw[i])),earth_model_id=_make_rid(emid[i]),
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
+            if ta: ar.takeoff_angle_errors=QuantityError(uncertainty=_nn(float(tou[i])))
+            ar.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(ar)
         return out
 
-    def _rd_ct(self,g,off,cnt):
-        if g is None or cnt==0: return []
+    def _rd_ct(self,cols,off,cnt):
+        if cols is None or cnt==0: return []
         out=[]
         for i in range(off,off+cnt):
             def gi(k):
-                v=int(g[k][i]); return None if v==-1 else v
+                v=int(cols[k][i]); return None if v==-1 else v
             def gf(k):
-                return _nn(float(g[k][i]))
+                return _nn(float(cols[k][i]))
             ct_obj=CompositeTime()
             # Integer fields: load value and the four QuantityError sub-fields
             # (uncertainty/lower/upper as ints, confidence_level as float).
@@ -1295,137 +1531,165 @@ class QMLH5:
             out.append(ct_obj)
         return out
 
-    def _rd_magnitudes(self,g,ei,ci_rows,txt,cid,cidx):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
-        scg=self._grp("station_mag_contributions"); out=[]
-        for i in idxs:
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
-            m=Magnitude(resource_id=_make_rid(gs("public_id")),mag=gf("mag_value"),
-                magnitude_type=gs("type"),origin_id=_make_rid(gs("origin_id")),
-                method_id=_make_rid(gs("method_id")),
-                station_count=_ni(int(g["station_count"][i])),
-                azimuthal_gap=gf("azimuthal_gap"),
-                evaluation_mode=_dec(int(g["eval_mode"][i]),EVALUATION_MODE),
-                evaluation_status=_dec(int(g["eval_status"][i]),EVALUATION_STATUS),
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
-            m.mag_errors=QuantityError(uncertainty=gf("mag_uncertainty"),
-                lower_uncertainty=gf("mag_lower_unc"),upper_uncertainty=gf("mag_upper_unc"),
-                confidence_level=gf("mag_conf"))
-            m.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
-            m.station_magnitude_contributions=self._rd_sc(scg,
-                int(g["contrib_offset"][i]),int(g["contrib_count"][i]))
+    def _rd_magnitudes(self,cols,mg_s,mg_e,ei,sc_cols,ci_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(mg_s[ei]), int(mg_e[ei])
+        if start == end: return []
+        pid=cols["public_id"]; mv=cols["mag_value"]; mu=cols["mag_uncertainty"]
+        mlo=cols["mag_lower_unc"]; mhi=cols["mag_upper_unc"]; mcf=cols["mag_conf"]
+        ty=cols["type"]; orig=cols["origin_id"]; mid=cols["method_id"]
+        scnt=cols["station_count"]; ag=cols["azimuthal_gap"]
+        emode=cols["eval_mode"]; estat=cols["eval_status"]; ci_i=cols["ci_idx"]
+        coff=cols["comment_offset"]; ccnt=cols["comment_count"]
+        soff=cols["contrib_offset"]; scnt2=cols["contrib_count"]
+        out=[]
+        for i in range(start, end):
+            m=Magnitude(resource_id=_make_rid(pid[i]),mag=_nn(float(mv[i])),
+                magnitude_type=(ty[i] or None),origin_id=_make_rid(orig[i]),
+                method_id=_make_rid(mid[i]),
+                station_count=_ni(int(scnt[i])),
+                azimuthal_gap=_nn(float(ag[i])),
+                evaluation_mode=_dec(int(emode[i]),EVALUATION_MODE),
+                evaluation_status=_dec(int(estat[i]),EVALUATION_STATUS),
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
+            m.mag_errors=QuantityError(uncertainty=_nn(float(mu[i])),
+                lower_uncertainty=_nn(float(mlo[i])),upper_uncertainty=_nn(float(mhi[i])),
+                confidence_level=_nn(float(mcf[i])))
+            m.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
+            m.station_magnitude_contributions=self._rd_sc(sc_cols,int(soff[i]),int(scnt2[i]))
             out.append(m)
         return out
 
-    def _rd_sc(self,g,off,cnt):
-        if g is None or cnt==0: return []
+    def _rd_sc(self,cols,off,cnt):
+        if cols is None or cnt==0: return []
+        smid=cols["station_magnitude_id"]; res=cols["residual"]; wt=cols["weight"]
         out=[]
         for i in range(off,off+cnt):
-            smid=_sv(g["station_magnitude_id"][i])
-            out.append(StationMagnitudeContribution(station_magnitude_id=_make_rid(smid),
-                residual=_nn(float(g["residual"][i])),weight=_nn(float(g["weight"][i]))))
+            out.append(StationMagnitudeContribution(
+                station_magnitude_id=_make_rid(smid[i]),
+                residual=_nn(float(res[i])),weight=_nn(float(wt[i]))))
         return out
 
-    def _rd_sta_mags(self,g,ei,ci_rows,wf_rows,txt,cid,cidx):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
+    def _rd_sta_mags(self,cols,sm_s,sm_e,ei,ci_rows,wf_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(sm_s[ei]), int(sm_e[ei])
+        if start == end: return []
+        pid=cols["public_id"]; orig=cols["origin_id"]; mv=cols["mag_value"]
+        mu=cols["mag_uncertainty"]; mlo=cols["mag_lower_unc"]; mhi=cols["mag_upper_unc"]
+        ty=cols["type"]; amid=cols["amplitude_id"]; mid=cols["method_id"]
+        wfidx_col=cols["waveform_idx"]; ci_i=cols["ci_idx"]
+        coff=cols["comment_offset"]; ccnt=cols["comment_count"]
         out=[]
-        for i in idxs:
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
-            wfidx=int(g["waveform_idx"][i])
-            sm=StationMagnitude(resource_id=_make_rid(gs("public_id")),
-                origin_id=_make_rid(gs("origin_id")),mag=gf("mag_value"),
-                station_magnitude_type=gs("type"),amplitude_id=_make_rid(gs("amplitude_id")),
-                method_id=_make_rid(gs("method_id")),
+        for i in range(start, end):
+            wfidx=int(wfidx_col[i])
+            sm=StationMagnitude(resource_id=_make_rid(pid[i]),
+                origin_id=_make_rid(orig[i]),mag=_nn(float(mv[i])),
+                station_magnitude_type=(ty[i] or None),amplitude_id=_make_rid(amid[i]),
+                method_id=_make_rid(mid[i]),
                 waveform_id=wf_rows[wfidx] if wfidx<len(wf_rows) else None,
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
-            sm.mag_errors=QuantityError(uncertainty=gf("mag_uncertainty"),
-                lower_uncertainty=gf("mag_lower_unc"),upper_uncertainty=gf("mag_upper_unc"))
-            sm.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
+            sm.mag_errors=QuantityError(uncertainty=_nn(float(mu[i])),
+                lower_uncertainty=_nn(float(mlo[i])),upper_uncertainty=_nn(float(mhi[i])))
+            sm.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(sm)
         return out
 
-    def _rd_picks(self,g,ei,ci_rows,wf_rows,txt,cid,cidx):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
+    def _rd_picks(self,cols,pk_s,pk_e,ei,ci_rows,wf_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(pk_s[ei]), int(pk_e[ei])
+        if start == end: return []
+        pid=cols["public_id"]
+        tv=cols["time_value"]; tu=cols["time_uncertainty"]
+        tlo=cols["time_lower_unc"]; thi=cols["time_upper_unc"]; tcf=cols["time_conf"]
+        wfidx_col=cols["waveform_idx"]; fid=cols["filter_id"]; mid=cols["method_id"]
+        hsv_c=cols["hslow_value"]; hsu_c=cols["hslow_uncertainty"]
+        bzv_c=cols["baz_value"]; bzu_c=cols["baz_uncertainty"]
+        smid=cols["slowness_method_id"]; onset=cols["onset"]; ph=cols["phase_hint"]
+        pol=cols["polarity"]; emode=cols["eval_mode"]; estat=cols["eval_status"]
+        ci_i=cols["ci_idx"]; coff=cols["comment_offset"]; ccnt=cols["comment_count"]
         out=[]
-        for i in idxs:
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
-            tv=gf("time_value"); wfidx=int(g["waveform_idx"][i])
-            hsv=gf("hslow_value"); bvz=gf("baz_value")
-            p=Pick(resource_id=_make_rid(gs("public_id")),
-                time=_from_ts(tv) if tv else None,
+        for i in range(start, end):
+            tvv=_nn(float(tv[i])); wfidx=int(wfidx_col[i])
+            hsv=_nn(float(hsv_c[i])); bvz=_nn(float(bzv_c[i]))
+            p=Pick(resource_id=_make_rid(pid[i]),
+                time=_from_ts(tvv) if tvv else None,
                 waveform_id=wf_rows[wfidx] if wfidx<len(wf_rows) else None,
-                filter_id=_make_rid(gs("filter_id")),method_id=_make_rid(gs("method_id")),
-                horizontal_slowness=hsv,
-                backazimuth=bvz,
-                slowness_method_id=_make_rid(gs("slowness_method_id")),
-                onset=_dec(int(g["onset"][i]),PICK_ONSET),
-                phase_hint=gs("phase_hint"),
-                polarity=_dec(int(g["polarity"][i]),PICK_POLARITY),
-                evaluation_mode=_dec(int(g["eval_mode"][i]),EVALUATION_MODE),
-                evaluation_status=_dec(int(g["eval_status"][i]),EVALUATION_STATUS),
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
-            p.time_errors=QuantityError(uncertainty=gf("time_uncertainty"),
-                lower_uncertainty=gf("time_lower_unc"),upper_uncertainty=gf("time_upper_unc"),
-                confidence_level=gf("time_conf"))
-            if hsv: p.horizontal_slowness_errors=QuantityError(uncertainty=gf("hslow_uncertainty"))
-            if bvz: p.backazimuth_errors=QuantityError(uncertainty=gf("baz_uncertainty"))
-            p.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
+                filter_id=_make_rid(fid[i]),method_id=_make_rid(mid[i]),
+                horizontal_slowness=hsv,backazimuth=bvz,
+                slowness_method_id=_make_rid(smid[i]),
+                onset=_dec(int(onset[i]),PICK_ONSET),
+                phase_hint=(ph[i] or None),
+                polarity=_dec(int(pol[i]),PICK_POLARITY),
+                evaluation_mode=_dec(int(emode[i]),EVALUATION_MODE),
+                evaluation_status=_dec(int(estat[i]),EVALUATION_STATUS),
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
+            p.time_errors=QuantityError(uncertainty=_nn(float(tu[i])),
+                lower_uncertainty=_nn(float(tlo[i])),upper_uncertainty=_nn(float(thi[i])),
+                confidence_level=_nn(float(tcf[i])))
+            if hsv: p.horizontal_slowness_errors=QuantityError(uncertainty=_nn(float(hsu_c[i])))
+            if bvz: p.backazimuth_errors=QuantityError(uncertainty=_nn(float(bzu_c[i])))
+            p.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(p)
         return out
 
-    def _rd_amplitudes(self,g,ei,ci_rows,wf_rows,txt,cid,cidx):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
-        twg=self._grp("time_windows"); out=[]
-        for i in idxs:
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
-            wfidx=int(g["waveform_idx"][i]); twidx=int(g["time_window_idx"][i])
+    def _rd_amplitudes(self,cols,am_s,am_e,ei,tw_cols,ci_rows,wf_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(am_s[ei]), int(am_e[ei])
+        if start == end: return []
+        pid=cols["public_id"]; av=cols["amp_value"]; au=cols["amp_uncertainty"]
+        alo=cols["amp_lower_unc"]; ahi=cols["amp_upper_unc"]; acf=cols["amp_conf"]
+        ty=cols["type"]; cat=cols["category"]; un=cols["unit"]; mid=cols["method_id"]
+        perv=cols["period_value"]; peru=cols["period_uncertainty"]; snr=cols["snr"]
+        twidx_col=cols["time_window_idx"]; pkid=cols["pick_id"]; wfidx_col=cols["waveform_idx"]
+        fid=cols["filter_id"]; stv=cols["scaling_time_value"]; stu=cols["scaling_time_unc"]
+        mhint=cols["magnitude_hint"]; emode=cols["eval_mode"]; estat=cols["eval_status"]
+        ci_i=cols["ci_idx"]; coff=cols["comment_offset"]; ccnt=cols["comment_count"]
+        out=[]
+        for i in range(start, end):
+            wfidx=int(wfidx_col[i]); twidx=int(twidx_col[i])
             tw=None
-            if twg is not None and twidx>=0:
-                tw=TimeWindow(begin=float(twg["begin"][twidx]),end=float(twg["end"][twidx]),
-                              reference=_from_ts(float(twg["reference"][twidx])))
-            perv=gf("period_value"); stv=gf("scaling_time_value")
-            a=Amplitude(resource_id=_make_rid(gs("public_id")),
-                generic_amplitude=gf("amp_value"),
-                type=gs("type"),category=_dec(int(g["category"][i]),AMPLITUDE_CATEGORY),
-                unit=_dec(int(g["unit"][i]),AMPLITUDE_UNIT),method_id=_make_rid(gs("method_id")),
-                period=perv,
-                snr=gf("snr"),time_window=tw,pick_id=_make_rid(gs("pick_id")),
+            if tw_cols is not None and twidx>=0:
+                tw=TimeWindow(begin=float(tw_cols["begin"][twidx]),
+                              end=float(tw_cols["end"][twidx]),
+                              reference=_from_ts(float(tw_cols["reference"][twidx])))
+            pv=_nn(float(perv[i])); sv=_nn(float(stv[i]))
+            a=Amplitude(resource_id=_make_rid(pid[i]),
+                generic_amplitude=_nn(float(av[i])),
+                type=(ty[i] or None),category=_dec(int(cat[i]),AMPLITUDE_CATEGORY),
+                unit=_dec(int(un[i]),AMPLITUDE_UNIT),method_id=_make_rid(mid[i]),
+                period=pv,snr=_nn(float(snr[i])),time_window=tw,
+                pick_id=_make_rid(pkid[i]),
                 waveform_id=wf_rows[wfidx] if wfidx<len(wf_rows) else None,
-                filter_id=_make_rid(gs("filter_id")),
-                scaling_time=_from_ts(stv) if stv else None,
-                magnitude_hint=gs("magnitude_hint"),
-                evaluation_mode=_dec(int(g["eval_mode"][i]),EVALUATION_MODE),
-                evaluation_status=_dec(int(g["eval_status"][i]),EVALUATION_STATUS),
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
-            a.generic_amplitude_errors=QuantityError(uncertainty=gf("amp_uncertainty"),
-                lower_uncertainty=gf("amp_lower_unc"),upper_uncertainty=gf("amp_upper_unc"),
-                confidence_level=gf("amp_conf"))
-            if perv: a.period_errors=QuantityError(uncertainty=gf("period_uncertainty"))
-            if stv:  a.scaling_time_errors=QuantityError(uncertainty=gf("scaling_time_unc"))
-            a.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
+                filter_id=_make_rid(fid[i]),
+                scaling_time=_from_ts(sv) if sv else None,
+                magnitude_hint=(mhint[i] or None),
+                evaluation_mode=_dec(int(emode[i]),EVALUATION_MODE),
+                evaluation_status=_dec(int(estat[i]),EVALUATION_STATUS),
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
+            a.generic_amplitude_errors=QuantityError(uncertainty=_nn(float(au[i])),
+                lower_uncertainty=_nn(float(alo[i])),upper_uncertainty=_nn(float(ahi[i])),
+                confidence_level=_nn(float(acf[i])))
+            if pv: a.period_errors=QuantityError(uncertainty=_nn(float(peru[i])))
+            if sv: a.scaling_time_errors=QuantityError(uncertainty=_nn(float(stu[i])))
+            a.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(a)
         return out
 
-    def _rd_focmecs(self,g,ei,ci_rows,wf_rows,txt,cid,cidx):
-        idxs=self._eidx(g,ei)
-        if not len(idxs): return []
-        mtg=self._grp("moment_tensors"); dug=self._grp("data_used")
-        wfpool=self._ra(g,"waveform_pool"); out=[]
-        for i in idxs:
-            def gf(k): return _nn(float(g[k][i]))
-            def gs(k): return _sv(g[k][i]) or None
+    def _rd_focmecs(self,cols,fm_s,fm_e,ei,mt_cols,du_cols,ci_rows,wf_rows,txt,cid,cidx):
+        if cols is None: return []
+        start, end = int(fm_s[ei]), int(fm_e[ei])
+        if start == end: return []
+        pid=cols["public_id"]; toid=cols["triggering_origin_id"]
+        wfpool=cols.get("waveform_pool")
+        pp_col=cols["preferred_plane"]
+        ag=cols["azimuthal_gap"]; spc=cols["station_polarity_count"]
+        mft=cols["misfit"]; sdr=cols["station_dist_ratio"]; mid=cols["method_id"]
+        emode=cols["eval_mode"]; estat=cols["eval_status"]; ci_i=cols["ci_idx"]
+        mtidx_c=cols["mt_idx"]; coff=cols["comment_offset"]; ccnt=cols["comment_count"]
+        wpoff_c=cols["waveform_pool_offset"]; wpcnt_c=cols["waveform_pool_count"]
+        out=[]
+        for i in range(start, end):
+            def gf(k): return _nn(float(cols[k][i]))
             # nodal planes
             np1=np2=None; nps=None
             s1=gf("np1_strike_value")
@@ -1441,7 +1705,7 @@ class QMLH5:
                 np2.dip_errors=QuantityError(uncertainty=gf("np2_dip_unc"))
                 np2.rake_errors=QuantityError(uncertainty=gf("np2_rake_unc"))
             if np1 or np2:
-                pp=int(g["preferred_plane"][i])
+                pp=int(pp_col[i])
                 nps=NodalPlanes(nodal_plane_1=np1,nodal_plane_2=np2,
                     preferred_plane=pp if pp else None)
             # principal axes
@@ -1458,37 +1722,34 @@ class QMLH5:
             t_ax=_ax("t"); p_ax=_ax("p"); n_ax=_ax("n")
             if t_ax or p_ax: pa=PrincipalAxes(t_axis=t_ax,p_axis=p_ax,n_axis=n_ax)
             # waveform IDs
-            wpoff=int(g["waveform_pool_offset"][i]); wpcnt=int(g["waveform_pool_count"][i])
+            wpoff=int(wpoff_c[i]); wpcnt=int(wpcnt_c[i])
             fm_wf=[wf_rows[int(wfpool[j])] for j in range(wpoff,wpoff+wpcnt)
                    if wfpool is not None and int(wfpool[j])<len(wf_rows)]
             # moment tensor
-            mtidx=int(g["mt_idx"][i])
-            mt=self._rd_mt(mtg,dug,mtidx,ci_rows,txt,cid,cidx) if mtidx>=0 else None
-            fm=FocalMechanism(resource_id=_make_rid(gs("public_id")),
-                triggering_origin_id=_make_rid(gs("triggering_origin_id")),
+            mtidx=int(mtidx_c[i])
+            mt=self._rd_mt(mt_cols,du_cols,mtidx,ci_rows,txt,cid,cidx) if mtidx>=0 else None
+            fm=FocalMechanism(resource_id=_make_rid(pid[i]),
+                triggering_origin_id=_make_rid(toid[i]),
                 nodal_planes=nps,principal_axes=pa,
-                azimuthal_gap=gf("azimuthal_gap"),
-                station_polarity_count=_ni(int(g["station_polarity_count"][i])),
-                misfit=gf("misfit"),station_distribution_ratio=gf("station_dist_ratio"),
-                method_id=_make_rid(gs("method_id")),
-                evaluation_mode=_dec(int(g["eval_mode"][i]),EVALUATION_MODE),
-                evaluation_status=_dec(int(g["eval_status"][i]),EVALUATION_STATUS),
-                creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][i])))
+                azimuthal_gap=_nn(float(ag[i])),
+                station_polarity_count=_ni(int(spc[i])),
+                misfit=_nn(float(mft[i])),station_distribution_ratio=_nn(float(sdr[i])),
+                method_id=_make_rid(mid[i]),
+                evaluation_mode=_dec(int(emode[i]),EVALUATION_MODE),
+                evaluation_status=_dec(int(estat[i]),EVALUATION_STATUS),
+                creation_info=self._mk_ci(ci_rows,int(ci_i[i])))
             fm.waveform_id=fm_wf
             if mt: fm.moment_tensor=mt
-            fm.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-                int(g["comment_offset"][i]),int(g["comment_count"][i]))
+            fm.comments=self._mk_comments(txt,cid,cidx,ci_rows,int(coff[i]),int(ccnt[i]))
             out.append(fm)
         return out
 
-    def _rd_mt(self,g,dug,idx,ci_rows,txt,cid,cidx):
-        if g is None or idx<0: return None
-        def gf(k): return _nn(float(g[k][idx]))
-        def gs(k): return _sv(g[k][idx]) or None
-        def rq2(vk,uk):
-            v=gf(vk); return v  # flat scalar; caller sets *_errors separately
+    def _rd_mt(self,cols,du_cols,idx,ci_rows,txt,cid,cidx):
+        if cols is None or idx<0: return None
+        def gf(k): return _nn(float(cols[k][idx]))
+        def gs(k): return cols[k][idx] or None
         # tensor
-        comps={s:rq2(f"{s}_value",f"{s}_unc") for s in ("rr","tt","pp","rt","rp","tp")}
+        comps={s:gf(f"{s}_value") for s in ("rr","tt","pp","rt","rp","tp")}
         tensor=None
         if any(v is not None for v in comps.values()):
             tensor=Tensor()
@@ -1500,21 +1761,21 @@ class QMLH5:
                     if u is not None:
                         setattr(tensor,f"{attr}_errors",QuantityError(uncertainty=u))
         # stf
-        stft=_dec(int(g["stf_type"][idx]),SOURCE_TIME_FUNC_TYPE)
+        stft=_dec(int(cols["stf_type"][idx]),SOURCE_TIME_FUNC_TYPE)
         stfd=gf("stf_duration")
         stf=SourceTimeFunction(type=stft,duration=stfd,rise_time=gf("stf_rise_time"),
             decay_time=gf("stf_decay_time")) if (stft or stfd) else None
         # data used
-        duoff=int(g["data_used_offset"][idx]); ducnt=int(g["data_used_count"][idx])
+        duoff=int(cols["data_used_offset"][idx]); ducnt=int(cols["data_used_count"][idx])
         data_used=[]
-        if dug is not None:
+        if du_cols is not None:
             for j in range(duoff,duoff+ducnt):
                 data_used.append(DataUsed(
-                    wave_type=_dec(int(dug["wave_type"][j]),DATA_USED_WAVE_TYPE),
-                    station_count=_ni(int(dug["station_count"][j])),
-                    component_count=_ni(int(dug["component_count"][j])),
-                    shortest_period=_nn(float(dug["shortest_period"][j])),
-                    longest_period=_nn(float(dug["longest_period"][j]))))
+                    wave_type=_dec(int(du_cols["wave_type"][j]),DATA_USED_WAVE_TYPE),
+                    station_count=_ni(int(du_cols["station_count"][j])),
+                    component_count=_ni(int(du_cols["component_count"][j])),
+                    shortest_period=_nn(float(du_cols["shortest_period"][j])),
+                    longest_period=_nn(float(du_cols["longest_period"][j]))))
         sm_v=gf("scalar_moment_value"); sm_u=gf("scalar_moment_unc")
         mt=MomentTensor(resource_id=_make_rid(gs("public_id")),
             derived_origin_id=_make_rid(gs("derived_origin_id")),
@@ -1525,13 +1786,13 @@ class QMLH5:
             greens_function_id=_make_rid(gs("greens_function_id")),
             filter_id=_make_rid(gs("filter_id")),source_time_function=stf,
             method_id=_make_rid(gs("method_id")),
-            category=_dec(int(g["category"][idx]),MT_CATEGORY),
-            inversion_type=_dec(int(g["inversion_type"][idx]),MT_INVERSION_TYPE),
-            creation_info=self._mk_ci(ci_rows,int(g["ci_idx"][idx])))
+            category=_dec(int(cols["category"][idx]),MT_CATEGORY),
+            inversion_type=_dec(int(cols["inversion_type"][idx]),MT_INVERSION_TYPE),
+            creation_info=self._mk_ci(ci_rows,int(cols["ci_idx"][idx])))
         if sm_v is not None: mt.scalar_moment_errors=QuantityError(uncertainty=sm_u)
         mt.data_used=data_used
         mt.comments=self._mk_comments(txt,cid,cidx,ci_rows,
-            int(g["comment_offset"][idx]),int(g["comment_count"][idx]))
+            int(cols["comment_offset"][idx]),int(cols["comment_count"][idx]))
         return mt
 
     # ------------------------------------------------------------------
@@ -1694,6 +1955,11 @@ class QMLH5:
     def query_depth(self,min_depth_m=0.0,max_depth_m=700_000.0):
         """Return origin row indices with depth (metres) in [min_depth_m, max_depth_m].
 
+        ObsPy stores depth in metres.  Typical ranges:
+          shallow crust  :   0 –  70 000 m
+          intermediate   :  70 – 300 000 m
+          deep           : 300 – 700 000 m
+
         Parameters
         ----------
         min_depth_m, max_depth_m : float — depth bounds in metres
@@ -1775,34 +2041,38 @@ class QMLH5:
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience API — mirrors ObsPy's ergonomic style.
+# Module-level convenience API
 #
-#   cat = qmlh5.read_catalog("incat.h5")
-#   qmlh5.write_catalog(cat, "outcat.h5")
-#   cat.write_catalog("outcat.h5")        # method patched onto Catalog below
+#   cat = qmlh5.read_catalog("cat.h5")
+#   qmlh5.write_catalog(cat, "out.h5")
+#   cat.write_catalog("out.h5")        # method patched onto Catalog below
 #
 # ---------------------------------------------------------------------------
-def read_catalog(path, event_indices=None):
+def read_catalog(path, event_indices=None, progress=True):
     """Read a QuakeML/HDF5 file and return an ObsPy :class:`Catalog`.
 
     Parameters
     ----------
     path : str
         Path to a qmlh5 file written by :func:`write_catalog` or
-        :class:`QMLH5`.
+        :class:`qmlh5`.
     event_indices : iterable of int, optional
         Subset of event row indices to load. If ``None`` (default), the
         entire catalog is loaded.
+    progress : bool, optional
+        Show a tqdm progress bar while reconstructing events. Defaults to
+        ``True``. Has no effect if tqdm is not installed, or for catalogs of
+        100 events or fewer.
 
     Returns
     -------
     obspy.core.event.Catalog
     """
-    with QMLH5(path, "r") as q:
-        return q.read_catalog(event_indices=event_indices)
+    with qmlh5(path, "r") as q:
+        return q.read_catalog(event_indices=event_indices, progress=progress)
 
 
-def write_catalog(catalog, path):
+def write_catalog(catalog, path, progress=True, chunk_size=10000):
     """Write an ObsPy :class:`Catalog` to a qmlh5 (HDF5) file.
 
     Parameters
@@ -1811,9 +2081,18 @@ def write_catalog(catalog, path):
         The catalog to serialize.
     path : str
         Destination file path. Will be created or overwritten.
+    progress : bool, optional
+        Show a tqdm progress bar while writing events. Defaults to ``True``.
+        Has no effect if tqdm is not installed, or for very small catalogs.
+    chunk_size : int or None, optional
+        Number of events to accumulate in RAM before flushing to disk. The
+        default of 10,000 keeps peak RAM in the low hundreds of MB even for
+        catalogs of millions of events. Pass ``None`` to disable chunking
+        (single-flush at the end) if you have plenty of memory and want to
+        avoid the small per-chunk overhead.
     """
-    with QMLH5(path, "w") as q:
-        q.write_catalog(catalog)
+    with qmlh5(path, "w") as q:
+        q.write_catalog(catalog, progress=progress, chunk_size=chunk_size)
 
 
 # Attach `write_catalog` as a method on ObsPy's Catalog so the user can write
@@ -1822,8 +2101,7 @@ def write_catalog(catalog, path):
 # built-in `Catalog.write` (which dispatches by `format=...` to ObsPy's I/O
 # plugins); this is a sibling, not a replacement.
 if OBSPY_AVAILABLE:
-    def _catalog_write_catalog(self, path):
+    def _catalog_write_catalog(self, path, progress=True, chunk_size=10000):
         """Write this catalog to a qmlh5 (HDF5) file. See :func:`qmlh5.write_catalog`."""
-        write_catalog(self, path)
+        write_catalog(self, path, progress=progress, chunk_size=chunk_size)
     Catalog.write_catalog = _catalog_write_catalog
-
