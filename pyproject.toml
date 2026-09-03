@@ -8,5 +8,5 @@ version = "1.1.0"
 description = "QuakeML to HDF5 read/write utility for ObsPy earthquake catalog objects"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = ['obspy','h5py','numpy']

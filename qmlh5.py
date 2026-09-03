@@ -189,13 +189,6 @@ class _WFTable:
         self.net,self.sta,self.loc,self.cha,self.uri=[],[],[],[],[]
     def add(self,wf):
         if wf is None: return np.uint32(0xFFFFFFFF)
-        key=(_rid(getattr(wf,"network_code","")) if not hasattr(wf,"network_code")
-             else (wf.network_code or ""),
-             wf.station_code or "" if hasattr(wf,"station_code") else "",
-             wf.location_code or "" if hasattr(wf,"location_code") else "",
-             wf.channel_code  or "" if hasattr(wf,"channel_code")  else "",
-             _rid(getattr(wf,"resource_uri",None)))
-        # simpler:
         net=getattr(wf,"network_code","") or ""
         sta=getattr(wf,"station_code","") or ""
         loc=getattr(wf,"location_code","") or ""
@@ -1931,7 +1924,7 @@ class qmlh5:
         center_lat, center_lon : float  — centre point in decimal degrees
         max_radius_deg : float          — outer radius in degrees
         min_radius_deg : float          — inner radius in degrees (default 0)
-        inverse : bool
+        invert : bool
              if False (default) return inside the radius
              if True, outside the radius
 
