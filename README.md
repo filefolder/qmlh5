@@ -36,6 +36,20 @@ cat.write('out.qml',format='QUAKEML')
 # OR you can write out again as an hdf5 object
 qmlh5.write_catalog(cat,'out.h5')
 
+# Print quick stats
+qmlh5.get_stats('huge_ml_catalog.h5')
+"""
+qmlh5 stats  huge_ml_catalog.h5
+  Origins:               83214
+  Latitude range:        32.1050 to 37.8890°
+  Longitude range:       -121.0230 to -114.0410°
+  Depth range:           0.0000 to 700000.0000 m
+  Latitude uncertainty:  0.0821 ± 0.0453°  (n=79102)
+  Longitude uncertainty: 0.0798 ± 0.0441°  (n=79102)
+  Depth uncertainty:     1204.3300 ± 890.1200 m  (n=81440)
+  Standard RMS error:    0.4310 ± 0.1820  (n=79877)
+"""
+
 # You can filter BEFORE loading, for speed.
 # Otherwise filter using the traditional Catalog object filters as before
 with qmlh5.qmlh5("huge_ml_catalog.h5") as q:
