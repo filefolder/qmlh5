@@ -44,15 +44,14 @@ qmlh5.write_catalog(cat,'out.h5')
 # Print quick stats
 qmlh5.get_stats('huge_ml_catalog.h5')
 """
-qmlh5 stats  huge_ml_catalog.h5
-  Origins:               83214
-  N-S span:              667.17 km
-  E-W span:              279.77 km  (at mean latitude)
-  Depth range:           1.00 to 20.00 km
-  Latitude uncertainty:  20.849 ± 8.223 km  (n=79102)
-  Longitude uncertainty: 10.869 ± 4.899 km  (n=79102)
-  Depth uncertainty:     0.188 ± 0.074 km  (n=81440)
-  Standard RMS error:    0.600 ± 0.141 s (n=3)
+    qmlh5 stats  huge_ml_catalog.h5
+      Origins:               39202
+      Latitude range:        -37.0319 to -29.0002°
+      Longitude range:       111.7592 to 139.9836°
+      Depth range:           -0.49 to 36.42 km
+      Horizontal uncertainty:3.899 ± 3.424 km  (n=39200)
+      Depth uncertainty:     4.260 ± 3.508 km  (n=39108)
+      RMS error:             0.426 ± 0.205 s  (n=39202)
 """
 
 # You can filter BEFORE loading, for speed.
@@ -88,7 +87,6 @@ with qmlh5.qmlh5("huge_ml_catalog.h5") as q:
     )
 
     cat = q.read_catalog(event_indices=events)
-
 
 ```
 
