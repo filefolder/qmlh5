@@ -2151,6 +2151,81 @@ class qmlh5:
             if k.startswith("n_") and k!="n_events":
                 print(f"  {k[2:].replace('_',' ').title():32s}{v}")
 
+    # ------------------------------------------------------------------
+    # Quick stats — column-only, no ObsPy objects built
+    # ------------------------------------------------------------------
+    def stats(self):
+        """Print (and return) a quick summary of the catalog's spatial
+        extent and average location uncertainty. Reads only the handful
+        of origins/origin_quality columns it needs — no ObsPy objects are
+        constructed, so this is fast even on huge catalogs.
+
+        Returns
+        -------
+        dict — lat/lon/depth ranges, plus mean/std/n for lat, lon and
+        depth uncertainty and for origin_quality.standard_error. NaN
+        (missing) values are excluded from every average and std.
+        """
+        og=self._grp("origins")
+        if og is None:
+            print(f"qmlh5 stats  {self._path}\n  No origins found.")
+            return {}
+
+        lat  =self._ra(og,"lat_value");        lon  =self._ra(og,"lon_value")
+        dep  =self._ra(og,"depth_value")
+        lat_u=self._ra(og,"lat_uncertainty");  lon_u=self._ra(og,"lon_uncertainty")
+        dep_u=self._ra(og,"depth_uncertainty")
+        qidx =self._ra(og,"quality_idx")
+
+        se=np.array([])
+        qg=self._grp("origin_quality")
+        if qg is not None and qidx is not None and qidx.size:
+            all_se=self._ra(qg,"standard_error")
+            if all_se is not None:
+                valid=qidx>=0
+                se=np.full(len(qidx),_NaN)
+                se[valid]=all_se[qidx[valid]]
+
+        def _range(arr):
+            if arr is None or arr.size==0: return (None,None)
+            arr=arr[~np.isnan(arr)]
+            return (float(arr.min()),float(arr.max())) if arr.size else (None,None)
+
+        def _avgstd(arr):
+            if arr is None or arr.size==0: return (None,None,0)
+            arr=arr[~np.isnan(arr)]
+            if arr.size==0: return (None,None,0)
+            return (float(arr.mean()),float(arr.std()),int(arr.size))
+
+        lat_range=_range(lat); lon_range=_range(lon); dep_range=_range(dep)
+        lat_avg,lat_std,lat_n=_avgstd(lat_u)
+        lon_avg,lon_std,lon_n=_avgstd(lon_u)
+        dep_avg,dep_std,dep_n=_avgstd(dep_u)
+        se_avg,se_std,se_n   =_avgstd(se)
+
+        out={"n_origins":int(len(lat)) if lat is not None else 0,
+             "lat_range":lat_range,"lon_range":lon_range,"depth_range_m":dep_range,
+             "lat_uncertainty_mean":lat_avg,"lat_uncertainty_std":lat_std,"lat_uncertainty_n":lat_n,
+             "lon_uncertainty_mean":lon_avg,"lon_uncertainty_std":lon_std,"lon_uncertainty_n":lon_n,
+             "depth_uncertainty_mean":dep_avg,"depth_uncertainty_std":dep_std,"depth_uncertainty_n":dep_n,
+             "standard_error_mean":se_avg,"standard_error_std":se_std,"standard_error_n":se_n}
+
+        def _fr(r,unit=""):
+            return "n/a" if r[0] is None else f"{r[0]:.4f} to {r[1]:.4f}{unit}"
+        def _fa(avg,std,n,unit=""):
+            return "n/a" if avg is None else f"{avg:.4f} ± {std:.4f}{unit}  (n={n})"
+
+        print(f"qmlh5 stats  {self._path}")
+        print(f"  Origins:               {out['n_origins']}")
+        print(f"  Latitude range:        {_fr(lat_range,'°')}")
+        print(f"  Longitude range:       {_fr(lon_range,'°')}")
+        print(f"  Depth range:           {_fr(dep_range,' m')}")
+        print(f"  Latitude uncertainty:  {_fa(lat_avg,lat_std,lat_n,'°')}")
+        print(f"  Longitude uncertainty: {_fa(lon_avg,lon_std,lon_n,'°')}")
+        print(f"  Depth uncertainty:     {_fa(dep_avg,dep_std,dep_n,' m')}")
+        print(f"  Standard RMS error:    {_fa(se_avg,se_std,se_n)}")
+
+        return out
 
 # ---------------------------------------------------------------------------
 # Module-level convenience API
@@ -2213,6 +2288,18 @@ def write_catalog(catalog, path, progress=True, chunk_size=10000):
     """
     with qmlh5(path, "w") as q:
         q.write_catalog(catalog, progress=progress, chunk_size=chunk_size)
+
+
+def get_stats(path):
+    """Point at a qmlh5 file and print a quick summary of its spatial
+    extent (lat/lon/depth range) and average location uncertainty
+    (lat, lon, depth, and origin_quality.standard_error — each with its
+    standard deviation). Column-only: no ObsPy objects are built, so this
+    is fast even on catalogs too large to comfortably read_catalog() in
+    full. Does NOT require ObsPy to be installed.
+    """
+    with qmlh5(path, "r") as q:
+        return q.stats()
 
 
 # Attach `write_catalog` as a method on ObsPy's Catalog so the user can write

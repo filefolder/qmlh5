@@ -8,7 +8,7 @@ For an example 80,000 event catalog object (with arrivals),
  * reading the h5 back in takes < 15 minutes
 
 Version 1.2 (25 Sept 2026)
- - Expand query capability, vectorize query_arrivals
+ - Expand query capability, add get_stats() helper, vectorize query_arrivals
 
 Version 1.1 (29 June 2026)
  - add chunking to significantly reduce RAM consumption for writes
