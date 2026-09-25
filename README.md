@@ -7,6 +7,8 @@ For an example 80,000 event catalog object (with arrivals),
  * writing to h5 now takes < 5 minutes (a 3.3G file)
  * reading the h5 back in takes < 15 minutes
 
+Version 1.2 (25 Sept 2026)
+ - Expand query capability, vectorize query_arrivals
 
 Version 1.1 (29 June 2026)
  - add chunking to significantly reduce RAM consumption for writes
@@ -34,26 +36,40 @@ cat.write('out.qml',format='QUAKEML')
 # OR you can write out again as an hdf5 object
 qmlh5.write_catalog(cat,'out.h5')
 
-# Some other convenience queries..
-with qmlh5("catalog.h5") as q:
-    idx = q.query_bbox(min_lat=35.0, max_lat=40.0,
-                       min_lon=-125.0, max_lon=-115.0)
+# You can filter BEFORE loading, for speed.
+# Otherwise filter using the traditional Catalog object filters as before
+with qmlh5.qmlh5("huge_ml_catalog.h5") as q:
+    events = q.query_events(
+        # bounding box: lat/lon rectangle
+        ("query_bbox", dict(min_lat=32, max_lat=37, min_lon=-120, max_lon=-114)),
 
-    idx = q.query_time("2021-03-01", "2021-04-01")   # UTCDateTime or float
+        # time window: origin time between two dates
+        ("query_time", dict(t_start="2006-01-01", t_end="2007-01-01")),
 
-    idx = q.query_magnitude(min_mag=5.0, max_mag=8.0, mag_type="Mw")
+        # magnitude range, optionally restricted to one magnitude type
+        ("query_magnitude", dict(min_mag=4.5, max_mag=9.0, mag_type="Mw")),
 
-    idx = q.query_radius(center_lat=37.5, center_lon=-121.0,
-                         max_radius_deg=1.0, min_radius_deg=0.2)
+        # circular (or annular) region around a point, in degrees
+        ("query_radius", dict(center_lat=34.05, center_lon=-118.25,
+                               max_radius_deg=2.0, min_radius_deg=0.0,
+                               invert=False)),
 
-    # Ray-casting point-in-polygon; vertices are (lat, lon) pairs.
-    idx = q.query_polygon([(40, -10), (40, 30), (55, 30), (55, -10)])
+        # arbitrary polygon, as (lat, lon) vertices
+        ("query_polygon", dict(vertices=[(40, -10), (40, 30),
+                                          (55, 30), (55, -10)],
+                                invert=False)),
 
-    # Depth in *meters*
-    idx = q.query_depth(min_depth_m=0.0, max_depth_m=5000)
+        # depth range, in metres
+        ("query_depth", dict(min_depth_m=0.0, max_depth_m=70_000.0)),
 
-    # "Defining arrivals" = origin_quality.used_phase_count.
-    idx = q.query_arrivals(min_count=8)   # optionally max_count=...
+        # number of phases actually used in the location solution
+        ("query_arrivals", dict(min_count=10, max_count=None)),
+
+        mode="union",   # nb "union" requires only ONE, "intersection" requires ALL
+    )
+
+    cat = q.read_catalog(event_indices=events)
+
 
 ```
 

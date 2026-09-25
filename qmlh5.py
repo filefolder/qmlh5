@@ -1,4 +1,6 @@
 """
+v1.2 September 25 2026
+
 qmlh5.py — Binary HDF5 storage for QuakeML 1.2 earthquake catalogs.
 
 All objects stored as flat columnar arrays. Cross-object links use integer
@@ -34,7 +36,7 @@ Limitations
   columnar format cannot accommodate arbitrary user-defined XML.
 * Comments without an explicit ``resource_id`` will receive a fresh
   auto-generated id on each XML serialization (an ObsPy quirk, not a
-  qmlh5 issue) — the underlying data is preserved.
+  qmlh5 issue). The underlying data is preserved.
 """
 from __future__ import annotations
 import json, math
@@ -59,10 +61,7 @@ try:
 except ImportError:
     OBSPY_AVAILABLE = False
 
-# tqdm is an optional dependency. When present, write operations show a
-# progress bar per event. `tqdm.auto` picks the right frontend for terminal
-# vs notebook automatically. If tqdm isn't installed, the progress=True
-# default silently falls back to no bar.
+# tqdm is optional, but nice!
 try:
     from tqdm.auto import tqdm
     TQDM_AVAILABLE = True
@@ -274,6 +273,14 @@ class qmlh5:
     with qmlh5("cat.h5")     as q: d = q.origins_dataframe()
     """
     FORMAT="qmlh5"; FORMAT_VERSION="1.0"; QUAKEML_VERSION="1.2"; CHUNK=1024
+
+    # Which table each query_* method's returned row indices refer to.
+    # Used by query_events() to auto-resolve the table without the caller
+    # having to name it.
+    QUERY_TABLE={"query_bbox":"origins","query_time":"origins",
+                 "query_radius":"origins","query_polygon":"origins",
+                 "query_depth":"origins","query_arrivals":"origins",
+                 "query_magnitude":"magnitudes"}
     _C  = dict(compression="gzip",compression_opts=4,shuffle=True)
     _CS = dict(compression="gzip",compression_opts=4)
 
@@ -2026,17 +2033,92 @@ class qmlh5:
         qidx=og["quality_idx"][()]          # int32, -1 = no quality object
         upc=qg["used_phase_count"][()]       # int32, -1 = null
 
-        n_orig=len(qidx)
-        mask=np.zeros(n_orig,dtype=bool)
-        for oi in range(n_orig):
-            qi=int(qidx[oi])
-            if qi<0: continue
-            v=int(upc[qi])
-            if v<0: continue
-            if v<min_count: continue
-            if max_count is not None and v>max_count: continue
-            mask[oi]=True
+        has_q=qidx>=0
+        v=np.full(len(qidx),-1,dtype=np.int64)
+        v[has_q]=upc[qidx[has_q]]
+        mask=has_q & (v>=0) & (v>=min_count)
+        if max_count is not None:
+            mask &= (v<=max_count)
         return np.where(mask)[0]
+
+    # ------------------------------------------------------------------
+    # Turning query_* row indices into event indices for read_catalog()
+    # ------------------------------------------------------------------
+    # Every query_* method above returns row indices into ONE table:
+    #   "origins"    <- query_bbox, query_time, query_radius,
+    #                   query_polygon, query_depth, query_arrivals
+    #   "magnitudes" <- query_magnitude
+    # read_catalog(event_indices=...) wants indices into the "catalog"
+    # (event) table instead, so those row indices need to be mapped
+    # through that table's own event_idx column first. rows_to_event_idx
+    # does that mapping; query_events combines several queries at once.
+
+    def rows_to_event_idx(self,group_name,rows):
+        """Map row indices in `group_name` (e.g. "origins", "magnitudes")
+        to the event indices they belong to.
+
+        Parameters
+        ----------
+        group_name : str — which table `rows` came from ("origins" for
+            query_bbox/query_time/query_radius/query_polygon/query_depth/
+            query_arrivals, "magnitudes" for query_magnitude).
+        rows : array-like of int — row indices, as returned by a query_* method.
+
+        Returns
+        -------
+        np.ndarray of int64 — sorted, de-duplicated event indices.
+        """
+        g=self._grp(group_name)
+        rows=np.asarray(rows,dtype=np.int64)
+        if g is None or rows.size==0: return np.array([],dtype=np.int64)
+        ev_col=self._ra(g,"event_idx")
+        if ev_col is None: return np.array([],dtype=np.int64)
+        return np.unique(ev_col[rows])
+
+    def query_events(self,*queries,mode="union"):
+        """Run one or more query_* methods and combine their results into
+        event indices, ready to pass straight into
+        read_catalog(event_indices=...). The source table for each query
+        method is looked up automatically via QUERY_TABLE, so you never
+        need to name it yourself.
+
+        Parameters
+        ----------
+        *queries : (method_name, kwargs_dict) pairs
+            method_name is the name of any query_* method (e.g. "query_bbox"),
+            kwargs_dict holds the keyword arguments to call it with.
+        mode : "union" or "intersection"
+            "union" — event matches ANY of the given queries (default)
+            "intersection" — event matches ALL of the given queries
+
+        Returns
+        -------
+        list of int — sorted, de-duplicated event indices
+
+        Example
+        -------
+        >>> events = q.query_events(
+        ...     ("query_bbox", dict(min_lat=32,max_lat=37,min_lon=-120,max_lon=-114)),
+        ...     ("query_magnitude", dict(min_mag=6.0)),
+        ...     mode="union")
+        >>> cat = q.read_catalog(event_indices=events)
+        """
+        sets=[]
+        for method_name,kwargs in queries:
+            if method_name not in self.QUERY_TABLE:
+                raise ValueError(f"{method_name!r} is not a known query_* method")
+            table=self.QUERY_TABLE[method_name]
+            rows=getattr(self,method_name)(**kwargs)
+            sets.append(set(self.rows_to_event_idx(table,rows).tolist()))
+        if not sets: return []
+        if mode=="union":
+            result=set().union(*sets)
+        elif mode=="intersection":
+            result=sets[0]
+            for s in sets[1:]: result&=s
+        else:
+            raise ValueError('mode must be "union" or "intersection"')
+        return sorted(result)
 
     # ------------------------------------------------------------------
     # Introspection
