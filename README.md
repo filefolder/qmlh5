@@ -52,7 +52,7 @@ qmlh5 stats  huge_ml_catalog.h5
   Latitude uncertainty:  20.849 ± 8.223 km  (n=79102)
   Longitude uncertainty: 10.869 ± 4.899 km  (n=79102)
   Depth uncertainty:     0.188 ± 0.074 km  (n=81440)
-  Standard error:        0.600 ± 0.141  (n=3)
+  Standard RMS error:    0.600 ± 0.141 s (n=3)
 """
 
 # You can filter BEFORE loading, for speed.

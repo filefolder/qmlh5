@@ -1,6 +1,4 @@
 """
-v1.2 September 25 2026
-
 qmlh5.py — Binary HDF5 storage for QuakeML 1.2 earthquake catalogs.
 
 All objects stored as flat columnar arrays. Cross-object links use integer
@@ -36,7 +34,7 @@ Limitations
   columnar format cannot accommodate arbitrary user-defined XML.
 * Comments without an explicit ``resource_id`` will receive a fresh
   auto-generated id on each XML serialization (an ObsPy quirk, not a
-  qmlh5 issue). The underlying data is preserved.
+  qmlh5 issue) — the underlying data is preserved.
 """
 from __future__ import annotations
 import json, math
@@ -61,7 +59,10 @@ try:
 except ImportError:
     OBSPY_AVAILABLE = False
 
-# tqdm is optional, but nice!
+# tqdm is an optional dependency. When present, write operations show a
+# progress bar per event. `tqdm.auto` picks the right frontend for terminal
+# vs notebook automatically. If tqdm isn't installed, the progress=True
+# default silently falls back to no bar.
 try:
     from tqdm.auto import tqdm
     TQDM_AVAILABLE = True
@@ -2156,31 +2157,38 @@ class qmlh5:
     # Quick stats — column-only, no ObsPy objects built
     # ------------------------------------------------------------------
     def stats(self):
-        """Print (and return) a quick summary of the catalog's spatial
-        extent and average location uncertainty, all in kilometres.
-        Reads only the handful of origins/origin_quality columns it
-        needs — no ObsPy objects are constructed, so this is fast even
-        on huge catalogs.
+        """Print (and return) a quick summary of the catalog: lat/lon
+        position range in degrees, depth range in km, average horizontal
+        location uncertainty in km (from OriginUncertainty, NOT from
+        latitude/longitude uncertainty — see below), average depth
+        uncertainty in km, and origin_quality standard_error (printed
+        as RMS error, in seconds). Reads only the handful of
+        origins/origin_quality/origin_uncertainty columns it needs — no
+        ObsPy objects are constructed, so this is fast even on huge
+        catalogs.
 
-        Notes on the km conversion
-        --------------------------
-        * Latitude: 1° ≈ _KM_PER_DEG km everywhere, so this is a simple
-          constant-factor conversion for both the N-S span and the
-          latitude-uncertainty average/std.
-        * Longitude: km per degree shrinks toward the poles by cos(lat),
-          so the E-W span uses the catalog's mean latitude, and each
-          origin's longitude uncertainty is converted using that
-          origin's OWN latitude before averaging — a single global
-          factor would be wrong for a catalog spanning much latitude.
-        * Depth is already a linear distance (metres), so it's just
-          divided by 1000 — no lat/lon-style correction needed.
+        Horizontal uncertainty is deliberately derived from
+        OriginUncertainty.horizontal_uncertainty (or, when that's
+        absent, the mean of min_horizontal_uncertainty and
+        max_horizontal_uncertainty) rather than from
+        latitude_errors.uncertainty / longitude_errors.uncertainty.
+        Those two are a RealQuantity sharing units with latitude/
+        longitude (degrees per spec) and are the field that ends up
+        mislabeled for catalogs sourced from SeisComP/SCML (see prior
+        discussion). OriginUncertainty's horizontal fields are plain
+        values, unambiguously metres regardless of source, so this
+        sidesteps that whole question rather than resolving it.
+
+        Depth is likewise unambiguously metres per spec, so depth range
+        and depth uncertainty are converted to km for readability.
 
         Returns
         -------
-        dict — lat/lon span in km, depth range in km, plus mean/std/n
-        (km) for lat, lon and depth uncertainty, and mean/std/n
-        (dimensionless) for origin_quality.standard_error. NaN
-        (missing) values are excluded from every average and std.
+        dict — lat/lon range (degrees), depth range (km), mean/std/n
+        (km) for horizontal and depth uncertainty, and mean/std/n
+        (seconds) for origin_quality.standard_error (RMS travel-time
+        residual). NaN (missing) values are excluded from every
+        average and std.
         """
         og=self._grp("origins")
         if og is None:
@@ -2189,9 +2197,9 @@ class qmlh5:
 
         lat  =self._ra(og,"lat_value");        lon  =self._ra(og,"lon_value")
         dep  =self._ra(og,"depth_value")
-        lat_u=self._ra(og,"lat_uncertainty");  lon_u=self._ra(og,"lon_uncertainty")
         dep_u=self._ra(og,"depth_uncertainty")
         qidx =self._ra(og,"quality_idx")
+        uidx =self._ra(og,"uncertainty_idx")
 
         se=np.array([])
         qg=self._grp("origin_quality")
@@ -2202,38 +2210,50 @@ class qmlh5:
                 se=np.full(len(qidx),_NaN)
                 se[valid]=all_se[qidx[valid]]
 
+        # --- horizontal uncertainty, from OriginUncertainty (metres, unambiguous) ---
+        horiz_km=np.array([])
+        oug=self._grp("origin_uncertainty")
+        if oug is not None and uidx is not None and uidx.size:
+            hu =self._ra(oug,"horizontal_uncertainty")
+            minu=self._ra(oug,"min_horizontal_uncertainty")
+            maxu=self._ra(oug,"max_horizontal_uncertainty")
+            mapped=uidx>=0
+            if mapped.any() and (hu is not None or (minu is not None and maxu is not None)):
+                n_rows=(len(hu) if hu is not None else len(minu))
+                mapped &= uidx<n_rows
+                horiz_km=np.full(len(uidx),_NaN)
+                if mapped.any():
+                    idx=uidx[mapped]
+                    picked=np.full(idx.shape,_NaN)
+                    if hu is not None:
+                        picked=hu[idx].copy()
+                    if minu is not None and maxu is not None:
+                        avg_mm=(minu[idx]+maxu[idx])/2.0
+                        need=np.isnan(picked)
+                        picked[need]=avg_mm[need]
+                    horiz_km[mapped]=picked/1000.0
+
+        def _range(arr):
+            if arr is None or arr.size==0: return (None,None)
+            arr=arr[~np.isnan(arr)]
+            return (float(arr.min()),float(arr.max())) if arr.size else (None,None)
+
         def _avgstd(arr):
             if arr is None or arr.size==0: return (None,None,0)
             arr=arr[~np.isnan(arr)]
             if arr.size==0: return (None,None,0)
             return (float(arr.mean()),float(arr.std()),int(arr.size))
 
-        # --- spans, in km ---
-        valid_lat=lat[~np.isnan(lat)] if lat is not None and lat.size else np.array([])
-        valid_lon=lon[~np.isnan(lon)] if lon is not None and lon.size else np.array([])
+        # --- position, in degrees ---
+        lat_range=_range(lat); lon_range=_range(lon)
+
+        # --- depth range, in km (metres per spec) ---
         valid_dep=dep[~np.isnan(dep)] if dep is not None and dep.size else np.array([])
-
-        lat_span_km=None
-        if valid_lat.size:
-            lat_span_km=float((valid_lat.max()-valid_lat.min())*_KM_PER_DEG)
-
-        lon_span_km=None
-        if valid_lon.size:
-            mean_lat=float(valid_lat.mean()) if valid_lat.size else 0.0
-            lon_span_km=float((valid_lon.max()-valid_lon.min())*_KM_PER_DEG*np.cos(np.radians(mean_lat)))
-
         dep_range_km=(None,None)
         if valid_dep.size:
             dep_range_km=(float(valid_dep.min()/1000.0),float(valid_dep.max()/1000.0))
 
-        # --- uncertainties, in km ---
-        lat_u_km = lat_u*_KM_PER_DEG if lat_u is not None else None
-        lat_avg,lat_std,lat_n=_avgstd(lat_u_km)
-
-        lon_u_km=None
-        if lon_u is not None and lat is not None and lon_u.size==lat.size:
-            lon_u_km = lon_u*_KM_PER_DEG*np.cos(np.radians(lat))
-        lon_avg,lon_std,lon_n=_avgstd(lon_u_km)
+        horiz_avg,horiz_std,horiz_n=_avgstd(horiz_km)
 
         dep_u_km = dep_u/1000.0 if dep_u is not None else None
         dep_avg,dep_std,dep_n=_avgstd(dep_u_km)
@@ -2241,28 +2261,25 @@ class qmlh5:
         se_avg,se_std,se_n=_avgstd(se)
 
         out={"n_origins":int(len(lat)) if lat is not None else 0,
-             "lat_span_km":lat_span_km,"lon_span_km":lon_span_km,"depth_range_km":dep_range_km,
-             "lat_uncertainty_mean_km":lat_avg,"lat_uncertainty_std_km":lat_std,"lat_uncertainty_n":lat_n,
-             "lon_uncertainty_mean_km":lon_avg,"lon_uncertainty_std_km":lon_std,"lon_uncertainty_n":lon_n,
+             "lat_range_deg":lat_range,"lon_range_deg":lon_range,"depth_range_km":dep_range_km,
+             "horizontal_uncertainty_mean_km":horiz_avg,"horizontal_uncertainty_std_km":horiz_std,
+             "horizontal_uncertainty_n":horiz_n,
              "depth_uncertainty_mean_km":dep_avg,"depth_uncertainty_std_km":dep_std,"depth_uncertainty_n":dep_n,
-             "standard_error_mean":se_avg,"standard_error_std":se_std,"standard_error_n":se_n}
+             "rms_error_mean":se_avg,"rms_error_std":se_std,"rms_error_n":se_n}
 
-        def _f1(v,unit=""):
-            return "n/a" if v is None else f"{v:.2f}{unit}"
-        def _fr(r,unit=""):
-            return "n/a" if r[0] is None else f"{r[0]:.2f} to {r[1]:.2f}{unit}"
+        def _fr(r,unit="",p=4):
+            return "n/a" if r[0] is None else f"{r[0]:.{p}f} to {r[1]:.{p}f}{unit}"
         def _fa(avg,std,n,unit=""):
             return "n/a" if avg is None else f"{avg:.3f} ± {std:.3f}{unit}  (n={n})"
 
         print(f"qmlh5 stats  {self._path}")
         print(f"  Origins:               {out['n_origins']}")
-        print(f"  N-S span:              {_f1(lat_span_km,' km')}")
-        print(f"  E-W span:              {_f1(lon_span_km,' km')}  (at mean latitude)")
-        print(f"  Depth range:           {_fr(dep_range_km,' km')}")
-        print(f"  Latitude uncertainty:  {_fa(lat_avg,lat_std,lat_n,' km')}")
-        print(f"  Longitude uncertainty: {_fa(lon_avg,lon_std,lon_n,' km')}")
+        print(f"  Latitude range:        {_fr(lat_range,'°')}")
+        print(f"  Longitude range:       {_fr(lon_range,'°')}")
+        print(f"  Depth range:           {_fr(dep_range_km,' km',2)}")
+        print(f"  Horizontal uncertainty:{_fa(horiz_avg,horiz_std,horiz_n,' km')}")
         print(f"  Depth uncertainty:     {_fa(dep_avg,dep_std,dep_n,' km')}")
-        print(f"  Standard error:        {_fa(se_avg,se_std,se_n)}")
+        print(f"  RMS error:             {_fa(se_avg,se_std,se_n,' s')}")
 
         return out
 
@@ -2332,11 +2349,12 @@ def write_catalog(catalog, path, progress=True, chunk_size=10000):
 
 def get_stats(path):
     """Point at a qmlh5 file and print a quick summary of its spatial
-    extent (lat/lon/depth range) and average location uncertainty
-    (lat, lon, depth, and origin_quality.standard_error — each with its
-    standard deviation). Column-only: no ObsPy objects are built, so this
-    is fast even on catalogs too large to comfortably read_catalog() in
-    full. Does NOT require ObsPy to be installed.
+    extent (lat/lon range and average location uncertainty in degrees,
+    depth range and average depth uncertainty in km) plus
+    origin_quality.standard_error (mean and standard deviation).
+    Column-only: no ObsPy objects are built, so this is fast even on
+    catalogs too large to comfortably read_catalog() in full. Does NOT
+    require ObsPy to be installed.
 
     Parameters
     ----------
