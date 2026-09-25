@@ -19,6 +19,11 @@ Version 1.1 (29 June 2026)
 Version 1.0 (April 26 2026)
  - initial release
 
+# How to install (via pip)
+$ python3 -m pip install git+https://github.com/filefolder/qmlh5
+
+# Usage examples
+
 ```python
 import qmlh5
 
@@ -41,13 +46,13 @@ qmlh5.get_stats('huge_ml_catalog.h5')
 """
 qmlh5 stats  huge_ml_catalog.h5
   Origins:               83214
-  Latitude range:        32.1050 to 37.8890°
-  Longitude range:       -121.0230 to -114.0410°
-  Depth range:           0.0000 to 700000.0000 m
-  Latitude uncertainty:  0.0821 ± 0.0453°  (n=79102)
-  Longitude uncertainty: 0.0798 ± 0.0441°  (n=79102)
-  Depth uncertainty:     1204.3300 ± 890.1200 m  (n=81440)
-  Standard RMS error:    0.4310 ± 0.1820  (n=79877)
+  N-S span:              667.17 km
+  E-W span:              279.77 km  (at mean latitude)
+  Depth range:           1.00 to 20.00 km
+  Latitude uncertainty:  20.849 ± 8.223 km  (n=79102)
+  Longitude uncertainty: 10.869 ± 4.899 km  (n=79102)
+  Depth uncertainty:     0.188 ± 0.074 km  (n=81440)
+  Standard error:        0.600 ± 0.141  (n=3)
 """
 
 # You can filter BEFORE loading, for speed.
