@@ -2294,16 +2294,18 @@ class qmlh5:
 # ---------------------------------------------------------------------------
 def read_catalog(path, event_indices=None, progress=True,
                  starttime=None, endtime=None):
-    """Read a QuakeML/HDF5 file and return an ObsPy :class:`Catalog`.
+    """Read one or more QuakeML/HDF5 files and return an ObsPy :class:`Catalog`.
 
     Parameters
     ----------
     path : str
-        Path to a qmlh5 file written by :func:`write_catalog` or
-        :class:`qmlh5`.
+        Path to a qmlh5 file, or a glob pattern (``*``, ``?``, ``[...]``)
+        that expands to one or more files.  When the pattern matches multiple
+        files they are read in sorted order and merged into a single catalog.
+        ``event_indices`` is ignored when multiple files are matched.
     event_indices : iterable of int, optional
-        Subset of event row indices to load. If ``None`` (default), the
-        entire catalog is loaded.
+        Subset of event row indices to load from a *single* file.  Ignored
+        when ``path`` expands to more than one file.
     progress : bool, optional
         Show a tqdm progress bar while reconstructing events. Defaults to
         ``True``. Has no effect if tqdm is not installed, or for catalogs of
@@ -2319,7 +2321,21 @@ def read_catalog(path, event_indices=None, progress=True,
     -------
     obspy.core.event.Catalog
     """
-    with qmlh5(path, "r") as q:
+    import glob as _glob
+    expanded = sorted(_glob.glob(str(path)))
+    if len(expanded) > 1:
+        if OBSPY_AVAILABLE:
+            merged = Catalog()
+        else:
+            raise ImportError("ObsPy is required to merge multiple files")
+        for p in expanded:
+            with qmlh5(p, "r") as q:
+                merged += q.read_catalog(progress=progress,
+                                         starttime=starttime, endtime=endtime)
+        return merged
+    # single file (glob matched exactly one, or no glob chars — open as-is)
+    single = expanded[0] if expanded else str(path)
+    with qmlh5(single, "r") as q:
         return q.read_catalog(event_indices=event_indices, progress=progress,
                               starttime=starttime, endtime=endtime)
 
