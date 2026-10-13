@@ -2387,3 +2387,73 @@ if OBSPY_AVAILABLE:
         """Write this catalog to a qmlh5 (HDF5) file. See :func:`qmlh5.write_catalog`."""
         write_catalog(self, path, progress=progress, chunk_size=chunk_size)
     Catalog.write_catalog = _catalog_write_catalog
+
+
+# ---------------------------------------------------------------------------
+# ObsPy-mirroring aliases
+#   read_events  → read_catalog   (mirrors obspy.read_events)
+#   write_events → write_catalog  (mirrors obspy.write_events)
+# ---------------------------------------------------------------------------
+read_events = read_catalog
+write_events = write_catalog
+
+
+# ---------------------------------------------------------------------------
+# Multi-catalog merging
+#
+#   cat = qmlh5.add('a.h5', 'b.h5')
+#   cat = qmlh5.add('*.h5')
+#   cat += qmlh5_instance          # via Catalog.__iadd__ monkey-patch below
+#
+# ---------------------------------------------------------------------------
+def add(*paths):
+    """Load and merge multiple qmlh5 files into one ObsPy :class:`Catalog`.
+
+    Accepts individual file paths, glob patterns, or any mix of the two.
+    Files are read in sorted order when a glob expands to multiple matches.
+
+    Parameters
+    ----------
+    *paths : str
+        One or more file paths or glob patterns (e.g. ``'*.h5'``).
+
+    Returns
+    -------
+    obspy.core.event.Catalog
+        A single catalog containing all events from every matched file.
+
+    Examples
+    --------
+    >>> import qmlh5
+    >>> cat = qmlh5.add('2024_01.h5', '2024_02.h5')
+    >>> cat = qmlh5.add('/data/catalogs/*.h5')
+    """
+    import glob as _glob
+    if not OBSPY_AVAILABLE:
+        raise ImportError("ObsPy is required for qmlh5.add()")
+    resolved = []
+    for p in paths:
+        expanded = sorted(_glob.glob(str(p)))
+        if expanded:
+            resolved.extend(expanded)
+        else:
+            resolved.append(str(p))   # keep as-is so the open() error is informative
+    merged = Catalog()
+    for path in resolved:
+        merged += read_catalog(path)
+    return merged
+
+
+# Support  cat += qmlh5_instance  by patching __iadd__ on ObsPy's Catalog.
+# The default Catalog.__iadd__ already handles another Catalog, but not a
+# qmlh5 instance directly.  We wrap it: if the right-hand side is a qmlh5
+# object (i.e. it has a read_catalog method) we materialise it first.
+if OBSPY_AVAILABLE:
+    _orig_catalog_iadd = Catalog.__iadd__
+
+    def _catalog_iadd_qmlh5(self, other):
+        if isinstance(other, qmlh5):
+            other = other.read_catalog()
+        return _orig_catalog_iadd(self, other)
+
+    Catalog.__iadd__ = _catalog_iadd_qmlh5

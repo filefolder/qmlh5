@@ -7,6 +7,12 @@ For an example 80,000 event catalog object (with arrivals),
  * writing to h5 now takes < 5 minutes (a 3.3G file)
  * reading the h5 back in takes < 15 minutes
 
+Version 1.3 (13 Oct 2026)
+ - New ways to merge catalogs (e.g. cat += qmlh5.add('202?.h5'))
+ - Add mirror functions read_events and write_events to match ObsPy behavior
+   read_catalog and write_catalog still work as before.
+ - Make tqdm mandatory 
+
 Version 1.2 (25 Sept 2026)
  - Expand query capability, add get_stats() helper, vectorize query_arrivals
 
@@ -29,6 +35,7 @@ import qmlh5
 
 cat = qmlh5.read_catalog('huge_ml_catalog.h5')
 # cat is an ObsPy catalog object
+# (can load multiple files at once via wildcards)
 
 # can also quickly read a specific timerange
 cat_2006 = qmlh5.read_catalog('huge_ml_catalog.h5',
